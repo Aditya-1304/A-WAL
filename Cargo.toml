@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 crc32c = "0.6.8"
+libc = "0.2.185"
