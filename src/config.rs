@@ -10,8 +10,8 @@ pub const DEFAULT_WRITE_BUFFER_COUNT: usize = 2;
 pub const DEFAULT_FORMAT_VERSION: u16 = 1;
 pub const DEFAULT_MAX_RECYCLED_SEGMENTS: usize = 8;
 
-pub const SEGMENT_HEADER_LEN: u64 = 64;
-pub const RECORD_HEADER_LEN: usize = 28;
+pub const SEGMENT_HEADER_LEN: u64 = 68;
+pub const RECORD_HEADER_LEN: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompressionPolicy {
