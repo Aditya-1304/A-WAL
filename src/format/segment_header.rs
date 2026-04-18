@@ -1,8 +1,8 @@
 use crate::{
     error::WalError,
     format::codec::{
-        copy_with_zeroed_range, is_all_zero, put_bytes, put_u8, put_u16_le, put_u32_le, put_u64_le,
-        read_array, read_u8, read_u16_le, read_u32_le, read_u64_le,
+        copy_with_zeroed_range, crc32c, is_all_zero, put_bytes, put_u8, put_u16_le, put_u32_le,
+        put_u64_le, read_array, read_u8, read_u16_le, read_u32_le, read_u64_le,
     },
     lsn::Lsn,
     types::{SegmentId, WalIdentity},
@@ -216,26 +216,6 @@ impl SegmentHeader {
                 | compression_algorithms::ZSTD
         )
     }
-}
-
-fn crc32c(bytes: &[u8]) -> u32 {
-    const POLY: u32 = 0x82F6_3B78;
-
-    let mut crc = !0u32;
-
-    for &byte in bytes {
-        crc ^= u32::from(byte);
-
-        for _ in 0..8 {
-            if crc & 1 == 1 {
-                crc = (crc >> 1) ^ POLY;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-
-    !crc
 }
 
 #[cfg(test)]

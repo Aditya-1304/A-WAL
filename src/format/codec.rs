@@ -1,5 +1,7 @@
 use std::ops::Range;
 
+pub use crc32c::crc32c;
+
 use crate::error::WalError;
 
 pub fn put_u8(buf: &mut Vec<u8>, value: u8) {
@@ -166,5 +168,11 @@ mod tests {
 
         assert_eq!(output, vec![1, 2, 0, 0, 0, 6]);
         assert_eq!(input, [1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn crc32c_matches_known_vectors() {
+        assert_eq!(crc32c(b""), 0x0000_0000);
+        assert_eq!(crc32c(b"123456789"), 0xE306_9283);
     }
 }
