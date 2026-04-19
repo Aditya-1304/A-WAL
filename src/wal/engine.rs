@@ -733,6 +733,7 @@ mod tests {
         let mut config = test_dir.config();
         config.storage_write_unit = 512;
         config.write_buffer_size = 2048;
+        config.max_record_size = 600;
 
         let mut wal = Wal::open(
             FsSegmentDirectory::new(test_dir.path().to_path_buf()),
@@ -756,6 +757,7 @@ mod tests {
     fn rollover_appends_segment_seal_and_switches_to_next_segment() {
         let test_dir = TestDir::new("rollover");
         let mut config = test_dir.config();
+        config.max_record_size = 16;
         config.target_segment_size = SEGMENT_HEADER_LEN + 48 + 56;
 
         let mut wal = Wal::open(
