@@ -56,7 +56,7 @@ impl SegmentFile for FsSegmentFile {
     }
 
     fn sync(&mut self) -> io::Result<()> {
-        self.file.flush()
+        self.file.sync_all()
     }
 
     fn truncate(&mut self, len: u64) -> io::Result<()> {
