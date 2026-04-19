@@ -74,6 +74,13 @@ impl Default for WalConfig {
 
 impl WalConfig {
     pub fn validate(&self) -> Result<(), WalError> {
+        if self.format_version != DEFAULT_FORMAT_VERSION {
+            return Err(WalError::invalid_config(format!(
+                "format_version must be {}, got {}",
+                DEFAULT_FORMAT_VERSION, self.format_version
+            )));
+        }
+
         if self.storage_write_unit < 512 {
             return Err(WalError::invalid_config(
                 "storage_write_unit must be at least 512",

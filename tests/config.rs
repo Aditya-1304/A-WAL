@@ -161,3 +161,19 @@ fn max_wal_size_when_set_must_be_non_zero() {
 
     assert!(matches!(err, WalError::InvalidConfig { .. }));
 }
+
+#[test]
+fn format_version_must_match_supported_v1_version() {
+    let err = expect_invalid_config(|config| {
+        config.format_version = 2;
+    });
+
+    assert!(matches!(err, WalError::InvalidConfig { .. }));
+}
+
+#[test]
+fn default_format_version_is_accepted() {
+    let config = WalConfig::default();
+    assert_eq!(config.format_version, DEFAULT_FORMAT_VERSION);
+    assert!(config.validate().is_ok());
+}
