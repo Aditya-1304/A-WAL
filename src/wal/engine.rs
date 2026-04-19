@@ -13,7 +13,10 @@ use crate::{
     },
     lsn::Lsn,
     types::{RecordType, SegmentId, record_flags, record_types},
-    wal::segment::ActiveSegment,
+    wal::{
+        iterator::{WalIterator, WalRecord, read_record_at_snapshot, snapshot_segments},
+        segment::ActiveSegment,
+    },
 };
 
 pub struct Wal<D, C>
@@ -547,6 +550,16 @@ where
         }
 
         Ok(())
+    }
+
+    pub fn read_at(&self, lsn: Lsn) -> Result<WalRecord, WalError> {
+        let segments = snapshot_segments(&self.directory, self.config.identity)?;
+        read_record_at_snapshot(&segments, self.config.record_alignment, lsn)
+    }
+
+    pub fn iter_from(&self, from: Lsn) -> Result<WalIterator<D::File>, WalError> {
+        let segments = snapshot_segments(&self.directory, self.config.identity)?;
+        WalIterator::new(segments, self.config.record_alignment, from)
     }
 }
 
