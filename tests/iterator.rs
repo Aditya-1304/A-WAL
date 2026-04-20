@@ -72,6 +72,7 @@ fn open_wal(test_dir: &TestDir) -> Wal<FsSegmentDirectory, ()> {
         (),
     )
     .expect("failed to open wal")
+    .0
 }
 
 fn open_wal_with_config(test_dir: &TestDir, mut config: WalConfig) -> Wal<FsSegmentDirectory, ()> {
@@ -84,6 +85,7 @@ fn open_wal_with_config(test_dir: &TestDir, mut config: WalConfig) -> Wal<FsSegm
         (),
     )
     .expect("failed to open wal")
+    .0
 }
 
 fn encode_record(

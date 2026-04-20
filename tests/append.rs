@@ -61,6 +61,7 @@ fn open_wal(test_dir: &TestDir) -> Wal<FsSegmentDirectory, ()> {
         (),
     )
     .expect("failed to open wal")
+    .0
 }
 
 #[test]
@@ -141,7 +142,7 @@ fn steady_state_drain_prefers_storage_write_unit_multiples() {
     config.write_buffer_size = 2048;
     config.max_record_size = 600;
 
-    let mut wal = Wal::open(
+    let (mut wal, _report) = Wal::open(
         FsSegmentDirectory::new(test_dir.path().to_path_buf()),
         config,
         (),
@@ -166,7 +167,7 @@ fn sync_policy_always_makes_append_durable_immediately() {
     let mut config = test_dir.config();
     config.sync_policy = SyncPolicy::Always;
 
-    let mut wal = Wal::open(
+    let (mut wal, _report) = Wal::open(
         FsSegmentDirectory::new(test_dir.path().to_path_buf()),
         config,
         (),
@@ -190,7 +191,7 @@ fn read_only_mode_rejects_append_flush_and_sync() {
     let mut config = test_dir.config();
     config.read_only = true;
 
-    let mut wal = Wal::open(
+    let (mut wal, _report) = Wal::open(
         FsSegmentDirectory::new(test_dir.path().to_path_buf()),
         config,
         (),
@@ -214,7 +215,7 @@ fn append_rejects_payloads_larger_than_max_record_size() {
     let mut config = test_dir.config();
     config.max_record_size = 16;
 
-    let mut wal = Wal::open(
+    let (mut wal, _report) = Wal::open(
         FsSegmentDirectory::new(test_dir.path().to_path_buf()),
         config,
         (),
@@ -246,7 +247,7 @@ fn reopen_restores_latest_next_lsn_from_segment_lengths() {
         assert_eq!(wal.durable_lsn(), Lsn::new(37));
     }
 
-    let reopened = Wal::open(
+    let (reopened, _report) = Wal::open(
         FsSegmentDirectory::new(test_dir.path().to_path_buf()),
         test_dir.config(),
         (),

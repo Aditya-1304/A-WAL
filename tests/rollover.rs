@@ -88,7 +88,7 @@ fn rollover_switches_to_next_segment_and_keeps_lsn_space_contiguous() {
     config.max_record_size = 16;
     config.target_segment_size = SEGMENT_HEADER_LEN + 48 + 56;
 
-    let mut wal = Wal::open(
+    let (mut wal, _report) = Wal::open(
         FsSegmentDirectory::new(test_dir.path().to_path_buf()),
         config,
         (),
@@ -116,7 +116,7 @@ fn rollover_creates_two_segments_sorted_by_base_lsn() {
     config.max_record_size = 16;
     config.target_segment_size = SEGMENT_HEADER_LEN + 48 + 56;
 
-    let mut wal = Wal::open(
+    let (mut wal, _report) = Wal::open(
         FsSegmentDirectory::new(test_dir.path().to_path_buf()),
         config,
         (),
@@ -145,7 +145,7 @@ fn sealed_segment_ends_with_segment_seal_record() {
     config.max_record_size = 16;
     config.target_segment_size = SEGMENT_HEADER_LEN + 48 + 56;
 
-    let mut wal = Wal::open(
+    let (mut wal, _report) = Wal::open(
         FsSegmentDirectory::new(test_dir.path().to_path_buf()),
         config,
         (),
@@ -182,7 +182,7 @@ fn segment_seal_payload_describes_the_sealed_segment() {
     config.max_record_size = 16;
     config.target_segment_size = SEGMENT_HEADER_LEN + 48 + 56;
 
-    let mut wal = Wal::open(
+    let (mut wal, _report) = Wal::open(
         FsSegmentDirectory::new(test_dir.path().to_path_buf()),
         config,
         (),
@@ -216,7 +216,7 @@ fn new_segment_header_base_lsn_matches_post_seal_tail() {
     config.max_record_size = 16;
     config.target_segment_size = SEGMENT_HEADER_LEN + 48 + 56;
 
-    let mut wal = Wal::open(
+    let (mut wal, _report) = Wal::open(
         FsSegmentDirectory::new(test_dir.path().to_path_buf()),
         config,
         (),
@@ -247,7 +247,7 @@ fn rollover_preserves_old_segment_file_length_after_switch() {
     config.max_record_size = 16;
     config.target_segment_size = SEGMENT_HEADER_LEN + 48 + 56;
 
-    let mut wal = Wal::open(
+    let (mut wal, _report) = Wal::open(
         FsSegmentDirectory::new(test_dir.path().to_path_buf()),
         config,
         (),

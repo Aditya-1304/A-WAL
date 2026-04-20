@@ -8,6 +8,7 @@ use crate::{
     },
     io::{
         buffer::{AppendBuffer, AppendBufferError},
+        control_file::FsControlFileStore,
         directory::{NewSegment, SegmentDirectory},
         segment_file::SegmentFile,
     },
@@ -15,6 +16,8 @@ use crate::{
     types::{RecordType, SegmentId, record_flags, record_types},
     wal::{
         iterator::{WalIterator, WalRecord, read_record_at_snapshot, snapshot_segments},
+        recovery::{RecoveredWal, recover},
+        report::RecoveryReport,
         segment::ActiveSegment,
     },
 };
@@ -31,6 +34,7 @@ where
     durable_lsn: Lsn,
     first_lsn: Option<Lsn>,
     current_wal_size: u64,
+    next_segment_id: SegmentId,
     active_segment_record_count: u64,
     _checksummer: C,
 }
@@ -57,25 +61,43 @@ impl<D, C> Wal<D, C>
 where
     D: SegmentDirectory,
 {
-    pub fn open(directory: D, config: WalConfig, checksummer: C) -> Result<Self, WalError> {
+    pub fn open(
+        directory: D,
+        config: WalConfig,
+        checksummer: C,
+    ) -> Result<(Self, RecoveryReport), WalError> {
         config.validate()?;
         Self::validate_constraints(&config)?;
 
-        let mut wal = Self {
+        let control_store = FsControlFileStore::new(config.dir.clone());
+        let write_buffer = AppendBuffer::new(config.write_buffer_size);
+
+        let RecoveredWal {
+            active_segment,
+            first_lsn,
+            next_lsn,
+            durable_lsn,
+            current_wal_size,
+            next_segment_id,
+            active_segment_record_count,
+            report,
+        } = recover(&directory, &control_store, &config)?;
+
+        let wal = Self {
             directory,
-            config: config.clone(),
-            active_segment: None,
-            write_buffer: AppendBuffer::new(config.write_buffer_size),
-            next_lsn: Lsn::ZERO,
-            durable_lsn: Lsn::ZERO,
-            first_lsn: None,
-            current_wal_size: 0,
-            active_segment_record_count: 0,
+            config,
+            active_segment,
+            write_buffer,
+            next_lsn,
+            durable_lsn,
+            first_lsn,
+            current_wal_size,
+            next_segment_id,
+            active_segment_record_count,
             _checksummer: checksummer,
         };
 
-        wal.initialize_from_directory()?;
-        Ok(wal)
+        Ok((wal, report))
     }
 
     pub fn append(&mut self, record_type: RecordType, payload: &[u8]) -> Result<Lsn, WalError> {
@@ -163,66 +185,12 @@ where
             .map(|segment| segment.segment_id())
     }
 
-    fn initialize_from_directory(&mut self) -> Result<(), WalError> {
-        let segments = self.directory.list_segments()?;
-        if segments.is_empty() {
-            return Ok(());
-        }
-
-        let mut previous_base_lsn = None;
-        let mut latest_open: Option<(D::File, SegmentHeader)> = None;
-
-        for meta in segments {
-            let file = self.directory.open_segment(meta.segment_id)?;
-            let header = read_segment_header(&file)?;
-
-            if header.segment_id != meta.segment_id || header.base_lsn != meta.base_lsn {
-                return Err(WalError::FilenameHeaderMismatch);
-            }
-
-            if header.identity() != self.config.identity {
-                return Err(WalError::IdentityMismatch {
-                    expected: self.config.identity,
-                    found: header.identity(),
-                });
-            }
-
-            if let Some(previous) = previous_base_lsn {
-                if header.base_lsn <= previous {
-                    return Err(WalError::SegmentOrderingViolation);
-                }
-            }
-
-            let file_len = file.len()?;
-            self.current_wal_size = self
-                .current_wal_size
-                .checked_add(file_len)
-                .ok_or(WalError::ReservationOverflow)?;
-
-            if self.first_lsn.is_none() && file_len > u64::from(header.header_len) {
-                self.first_lsn = Some(header.base_lsn);
-            }
-
-            previous_base_lsn = Some(header.base_lsn);
-            latest_open = Some((file, header));
-        }
-
-        if let Some((file, header)) = latest_open {
-            let active_segment = ActiveSegment::open(file, header)?;
-            self.next_lsn = active_segment.written_end_lsn()?;
-            self.durable_lsn = self.next_lsn;
-            self.active_segment = Some(active_segment);
-        }
-
-        Ok(())
-    }
-
     fn ensure_writable_segment(&mut self) -> Result<(), WalError> {
         if self.active_segment.is_some() {
             return Ok(());
         }
 
-        let segment = self.create_segment(1, self.next_lsn)?;
+        let segment = self.create_segment(self.next_segment_id, self.next_lsn)?;
         self.active_segment = Some(segment);
         self.active_segment_record_count = 0;
         Ok(())
@@ -233,6 +201,10 @@ where
         segment_id: SegmentId,
         base_lsn: Lsn,
     ) -> Result<ActiveSegment<D::File>, WalError> {
+        let following_segment_id = segment_id
+            .checked_add(1)
+            .ok_or(WalError::ReservationOverflow)?;
+
         let mut header = SegmentHeader::new(
             self.config.identity,
             segment_id,
@@ -254,6 +226,7 @@ where
             .checked_add(active_segment.file_len())
             .ok_or(WalError::ReservationOverflow)?;
 
+        self.next_segment_id = following_segment_id;
         Ok(active_segment)
     }
 
@@ -306,11 +279,6 @@ where
 
     fn rollover(&mut self) -> Result<(), WalError> {
         let seal_payload = self.build_segment_seal_payload()?.encode();
-        let current_segment_id = self
-            .active_segment
-            .as_ref()
-            .ok_or(WalError::BrokenDurabilityContract)?
-            .segment_id();
 
         self.stage_record(
             record_types::SEGMENT_SEAL,
@@ -326,12 +294,8 @@ where
             segment.mark_sealed();
         }
 
-        let next_segment_id = current_segment_id
-            .checked_add(1)
-            .ok_or(WalError::ReservationOverflow)?;
         let next_base_lsn = self.next_lsn;
-
-        let new_segment = self.create_segment(next_segment_id, next_base_lsn)?;
+        let new_segment = self.create_segment(self.next_segment_id, next_base_lsn)?;
         self.active_segment = Some(new_segment);
         self.active_segment_record_count = 0;
 
@@ -563,12 +527,7 @@ where
     }
 }
 
-fn read_segment_header<F: SegmentFile>(file: &F) -> Result<SegmentHeader, WalError> {
-    let mut bytes = [0u8; SegmentHeader::ENCODED_LEN];
-    read_exact_at(file, 0, &mut bytes)?;
-    SegmentHeader::decode(&bytes)
-}
-
+#[cfg(test)]
 fn read_exact_at<F: SegmentFile>(file: &F, offset: u64, buf: &mut [u8]) -> Result<(), WalError> {
     let mut filled = 0usize;
 
@@ -676,6 +635,7 @@ mod tests {
             (),
         )
         .expect("failed to open test wal")
+        .0
     }
 
     #[test]
@@ -748,7 +708,7 @@ mod tests {
         config.write_buffer_size = 2048;
         config.max_record_size = 600;
 
-        let mut wal = Wal::open(
+        let (mut wal, _report) = Wal::open(
             FsSegmentDirectory::new(test_dir.path().to_path_buf()),
             config,
             (),
@@ -773,7 +733,7 @@ mod tests {
         config.max_record_size = 16;
         config.target_segment_size = SEGMENT_HEADER_LEN + 48 + 56;
 
-        let mut wal = Wal::open(
+        let (mut wal, _report) = Wal::open(
             FsSegmentDirectory::new(test_dir.path().to_path_buf()),
             config,
             (),
@@ -818,7 +778,7 @@ mod tests {
             assert_eq!(wal.next_lsn(), Lsn::new(37));
         }
 
-        let reopened = Wal::open(
+        let (reopened, _report) = Wal::open(
             FsSegmentDirectory::new(test_dir.path().to_path_buf()),
             test_dir.config(),
             (),

@@ -13,7 +13,7 @@ use crate::{
         segment_file::SegmentFile,
     },
     lsn::Lsn,
-    types::{RecordType, record_types},
+    types::{RecordType, SegmentId, record_types},
     wal::{
         report::RecoveryReport,
         segment::{ActiveSegment, SegmentDescriptor},
@@ -26,6 +26,8 @@ pub struct RecoveredWal<F> {
     pub next_lsn: Lsn,
     pub durable_lsn: Lsn,
     pub current_wal_size: u64,
+    pub next_segment_id: SegmentId,
+    pub active_segment_record_count: u64,
     pub report: RecoveryReport,
 }
 
@@ -33,11 +35,13 @@ struct RecoveredSegment<F> {
     file: F,
     header: SegmentHeader,
     descriptor: SegmentDescriptor,
+    record_count: u64,
     last_valid_record_type: Option<RecordType>,
 }
 
 struct SegmentScanResult {
     valid_end_offset: u64,
+    record_count: u64,
     last_valid_record_type: Option<RecordType>,
     tail_error: Option<WalError>,
 }
@@ -75,6 +79,8 @@ pub fn recover<D: SegmentDirectory>(
             next_lsn: Lsn::ZERO,
             durable_lsn: Lsn::ZERO,
             current_wal_size: 0,
+            next_segment_id: 1,
+            active_segment_record_count: 0,
             report,
         });
     }
@@ -117,6 +123,20 @@ pub fn recover<D: SegmentDirectory>(
         None => Lsn::ZERO,
     };
 
+    let next_segment_id = match last_kept_segment.as_ref() {
+        Some(segment) => segment
+            .descriptor
+            .segment_id
+            .checked_add(1)
+            .ok_or(WalError::ReservationOverflow)?,
+        None => 1,
+    };
+
+    let active_segment_record_count = match last_kept_segment.as_ref() {
+        Some(segment) if !segment_is_sealed(segment) => segment.record_count,
+        _ => 0,
+    };
+
     report.set_next_lsn(next_lsn);
     report.set_segments_prunable(0);
     report.set_recovery_duration(started.elapsed());
@@ -130,6 +150,8 @@ pub fn recover<D: SegmentDirectory>(
         next_lsn,
         durable_lsn: next_lsn,
         current_wal_size,
+        next_segment_id,
+        active_segment_record_count,
         report,
     })
 }
@@ -223,6 +245,7 @@ fn recover_segment<D: SegmentDirectory>(
         file,
         header,
         descriptor,
+        record_count: scan.record_count,
         last_valid_record_type: scan.last_valid_record_type,
     }))
 }
@@ -267,6 +290,7 @@ fn scan_segment<F: SegmentFile>(
 ) -> Result<SegmentScanResult, WalError> {
     let mut file_offset = descriptor.header_len;
     let mut expected_lsn = descriptor.base_lsn;
+    let mut record_count = 0u64;
     let mut last_valid_record_type = None;
 
     while file_offset < descriptor.file_len {
@@ -286,6 +310,9 @@ fn scan_segment<F: SegmentFile>(
                     checkpoint_lsns.insert(record.header.lsn);
                 }
 
+                record_count = record_count
+                    .checked_add(1)
+                    .ok_or(WalError::ReservationOverflow)?;
                 last_valid_record_type = Some(record.header.record_type);
                 file_offset = record.next_file_offset;
                 expected_lsn = record.next_lsn;
@@ -293,6 +320,7 @@ fn scan_segment<F: SegmentFile>(
             Err(err) => {
                 return Ok(SegmentScanResult {
                     valid_end_offset: file_offset,
+                    record_count,
                     last_valid_record_type,
                     tail_error: Some(err),
                 });
@@ -302,6 +330,7 @@ fn scan_segment<F: SegmentFile>(
 
     Ok(SegmentScanResult {
         valid_end_offset: file_offset,
+        record_count,
         last_valid_record_type,
         tail_error: None,
     })
@@ -369,6 +398,13 @@ fn validate_record_at<F: SegmentFile>(
     })
 }
 
+fn segment_is_sealed<F>(segment: &RecoveredSegment<F>) -> bool {
+    matches!(
+        segment.last_valid_record_type,
+        Some(record_type) if record_type == record_types::SEGMENT_SEAL
+    )
+}
+
 fn build_active_segment<F: SegmentFile>(
     last_kept_segment: Option<RecoveredSegment<F>>,
 ) -> Result<Option<ActiveSegment<F>>, WalError> {
@@ -376,12 +412,7 @@ fn build_active_segment<F: SegmentFile>(
         return Ok(None);
     };
 
-    let is_sealed = matches!(
-        segment.last_valid_record_type,
-        Some(record_type) if record_type == record_types::SEGMENT_SEAL
-    );
-
-    if is_sealed {
+    if segment_is_sealed(&segment) {
         return Ok(None);
     }
 
