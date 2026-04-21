@@ -34,6 +34,13 @@ pub struct ShutdownTail {
     pub segment_id: SegmentId,
     pub shutdown_lsn: Lsn,
     pub next_lsn: Lsn,
+    pub record_count: u64,
+}
+
+#[derive(Debug, Clone)]
+struct TailScanResult {
+    last_record: Option<TailRecord>,
+    record_count: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -104,14 +111,15 @@ pub(crate) fn find_shutdown_tail<D: SegmentDirectory>(
         Err(_) => return Ok(None),
     };
 
-    let Some(last_record) = scan_last_record_in_segment(
+    let scan = scan_last_record_in_segment(
         &file,
         &descriptor,
         &header,
         max_record_size,
         record_alignment,
-    )?
-    else {
+    )?;
+
+    let Some(last_record) = scan.last_record else {
         return Ok(None);
     };
 
@@ -123,6 +131,7 @@ pub(crate) fn find_shutdown_tail<D: SegmentDirectory>(
         segment_id: descriptor.segment_id,
         shutdown_lsn: last_record.lsn,
         next_lsn: last_record.next_lsn,
+        record_count: scan.record_count,
     }))
 }
 
@@ -132,10 +141,11 @@ fn scan_last_record_in_segment<F: SegmentFile>(
     segment_header: &SegmentHeader,
     max_record_size: u32,
     record_alignment: u32,
-) -> Result<Option<TailRecord>, WalError> {
+) -> Result<TailScanResult, WalError> {
     let mut file_offset = descriptor.header_len;
     let mut expected_lsn = descriptor.base_lsn;
     let mut last_record = None;
+    let mut record_count = 0u64;
 
     while file_offset < descriptor.file_len {
         let record = match validate_record_at(
@@ -149,15 +159,27 @@ fn scan_last_record_in_segment<F: SegmentFile>(
         ) {
             Ok(record) => record,
             Err(err) if is_io_like(&err) => return Err(err),
-            Err(_) => return Ok(None),
+            Err(_) => {
+                return Ok(TailScanResult {
+                    last_record: None,
+                    record_count: 0,
+                });
+            }
         };
+
+        record_count = record_count
+            .checked_add(1)
+            .ok_or(WalError::ReservationOverflow)?;
 
         file_offset = record.next_file_offset;
         expected_lsn = record.next_lsn;
         last_record = Some(record);
     }
 
-    Ok(last_record)
+    Ok(TailScanResult {
+        last_record,
+        record_count,
+    })
 }
 
 fn validate_record_at<F: SegmentFile>(
@@ -479,6 +501,7 @@ mod tests {
         assert_eq!(tail.segment_id, 1);
         assert_eq!(tail.shutdown_lsn, shutdown_lsn);
         assert_eq!(tail.next_lsn, Lsn::new((user_record.len() + 32) as u64));
+        assert_eq!(tail.record_count, 2);
     }
 
     #[test]
