@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use crate::{
     config::{CompressionPolicy, RECORD_HEADER_LEN, SEGMENT_HEADER_LEN, SyncPolicy, WalConfig},
     error::WalError,
@@ -16,9 +18,11 @@ use crate::{
     types::{RecordType, SegmentId, record_flags, record_types},
     wal::{
         iterator::{WalIterator, WalRecord, read_record_at_snapshot, snapshot_segments},
+        metrics::WalMetrics,
         recovery::{RecoveredWal, recover},
         report::RecoveryReport,
         segment::ActiveSegment,
+        shutdown::{CheckpointState, clear_clean_shutdown, publish_clean_shutdown},
     },
 };
 
@@ -27,6 +31,7 @@ where
     D: SegmentDirectory,
 {
     directory: D,
+    control_store: FsControlFileStore,
     config: WalConfig,
     active_segment: Option<ActiveSegment<D::File>>,
     write_buffer: AppendBuffer,
@@ -36,6 +41,9 @@ where
     current_wal_size: u64,
     next_segment_id: SegmentId,
     active_segment_record_count: u64,
+    checkpoint_state: CheckpointState,
+    metrics: WalMetrics,
+    shutdown_in_progress: bool,
     _checksummer: C,
 }
 
@@ -70,6 +78,7 @@ where
         Self::validate_constraints(&config)?;
 
         let control_store = FsControlFileStore::new(config.dir.clone());
+        let prior_control = control_store.load_for_recovery(config.identity)?;
         let write_buffer = AppendBuffer::new(config.write_buffer_size);
 
         let RecoveredWal {
@@ -83,8 +92,28 @@ where
             report,
         } = recover(&directory, &control_store, &config)?;
 
+        let checkpoint_state = CheckpointState {
+            last_checkpoint_lsn: report.checkpoint_lsn,
+            checkpoint_no: prior_control
+                .as_ref()
+                .map(|control| control.checkpoint_no)
+                .unwrap_or(0),
+        };
+
+        if !config.read_only
+            && prior_control
+                .as_ref()
+                .is_some_and(|control| control.clean_shutdown)
+        {
+            clear_clean_shutdown(&control_store, config.identity, checkpoint_state)?;
+        }
+
+        let mut metrics = WalMetrics::new(current_wal_size);
+        metrics.note_recovery(&report);
+
         let wal = Self {
             directory,
+            control_store,
             config,
             active_segment,
             write_buffer,
@@ -94,6 +123,9 @@ where
             current_wal_size,
             next_segment_id,
             active_segment_record_count,
+            checkpoint_state,
+            metrics,
+            shutdown_in_progress: false,
             _checksummer: checksummer,
         };
 
@@ -101,7 +133,7 @@ where
     }
 
     pub fn append(&mut self, record_type: RecordType, payload: &[u8]) -> Result<Lsn, WalError> {
-        self.ensure_mutable()?;
+        self.ensure_operational()?;
 
         if payload.len() > self.config.max_record_size as usize {
             return Err(WalError::PayloadTooLarge {
@@ -112,7 +144,9 @@ where
 
         self.ensure_writable_segment()?;
 
+        let original_payload_len = payload.len() as u64;
         let (on_disk_payload, flags) = self.prepare_payload_for_append(payload)?;
+        let record_bytes = self.record_physical_len_for_payload_len(on_disk_payload.len())? as u64;
         let lsn = self.stage_record(record_type, flags, &on_disk_payload, true)?;
 
         self.active_segment_record_count = self
@@ -124,6 +158,13 @@ where
             self.first_lsn = Some(lsn);
         }
 
+        self.metrics.note_record_append(record_bytes);
+
+        if flags & record_flags::COMPRESSED != 0 {
+            self.metrics
+                .note_compression(original_payload_len, on_disk_payload.len() as u64);
+        }
+
         if matches!(self.config.sync_policy, SyncPolicy::Always) {
             self.sync()?;
         }
@@ -132,31 +173,68 @@ where
     }
 
     pub fn flush(&mut self) -> Result<(), WalError> {
+        self.ensure_operational()?;
+        self.flush_inner()
+    }
+
+    pub fn sync(&mut self) -> Result<(), WalError> {
+        self.ensure_operational()?;
+        self.sync_inner()
+    }
+
+    pub fn shutdown(&mut self) -> Result<(), WalError> {
         self.ensure_mutable()?;
 
-        if self.active_segment.is_none() {
-            return Ok(());
+        if self.shutdown_in_progress {
+            return Err(WalError::ShutdownInProgress);
         }
 
-        self.drain_buffer(false)?;
+        self.shutdown_in_progress = true;
 
-        if let Some(segment) = self.active_segment.as_mut() {
-            segment.file_mut().flush()?;
+        self.flush_inner()?;
+        self.sync_inner()?;
+        self.ensure_writable_segment()?;
+
+        let shutdown_bytes = self.record_physical_len_for_payload_len(0)? as u64;
+        if !self.active_segment_can_fit(shutdown_bytes, false)? {
+            if self.active_segment_is_empty() {
+                return Err(WalError::invalid_config(
+                    "active segment cannot fit SHUTDOWN record",
+                ));
+            }
+
+            self.rollover()?;
         }
+
+        let shutdown_lsn =
+            self.stage_record(record_types::SHUTDOWN, record_flags::NONE, &[], false)?;
+
+        self.active_segment_record_count = self
+            .active_segment_record_count
+            .checked_add(1)
+            .ok_or(WalError::ReservationOverflow)?;
+
+        if self.first_lsn.is_none() {
+            self.first_lsn = Some(shutdown_lsn);
+        }
+
+        self.metrics.note_record_append(shutdown_bytes);
+
+        self.flush_inner()?;
+        self.sync_inner()?;
+
+        publish_clean_shutdown(
+            &self.control_store,
+            self.config.identity,
+            self.checkpoint_state,
+        )?;
+        self.metrics.note_clean_shutdown();
 
         Ok(())
     }
 
-    pub fn sync(&mut self) -> Result<(), WalError> {
-        self.ensure_mutable()?;
-        self.flush()?;
-
-        if let Some(segment) = self.active_segment.as_mut() {
-            segment.file_mut().sync()?;
-        }
-
-        self.durable_lsn = self.next_lsn;
-        Ok(())
+    pub fn metrics(&self) -> WalMetrics {
+        self.metrics.clone()
     }
 
     pub fn next_lsn(&self) -> Lsn {
@@ -227,6 +305,7 @@ where
             .ok_or(WalError::ReservationOverflow)?;
 
         self.next_segment_id = following_segment_id;
+        self.metrics.set_current_wal_size(self.current_wal_size);
         Ok(active_segment)
     }
 
@@ -287,8 +366,8 @@ where
             false,
         )?;
 
-        self.flush()?;
-        self.sync()?;
+        self.flush_inner()?;
+        self.sync_inner()?;
 
         if let Some(segment) = self.active_segment.as_mut() {
             segment.mark_sealed();
@@ -298,6 +377,7 @@ where
         let new_segment = self.create_segment(self.next_segment_id, next_base_lsn)?;
         self.active_segment = Some(new_segment);
         self.active_segment_record_count = 0;
+        self.metrics.note_segment_rollover();
 
         Ok(())
     }
@@ -387,6 +467,7 @@ where
                 .current_wal_size
                 .checked_add(chunk_len)
                 .ok_or(WalError::ReservationOverflow)?;
+            self.metrics.set_current_wal_size(self.current_wal_size);
 
             if !steady_state {
                 break;
@@ -482,6 +563,49 @@ where
         if self.config.read_only {
             return Err(WalError::ReadOnlyViolation);
         }
+
+        Ok(())
+    }
+
+    fn ensure_operational(&self) -> Result<(), WalError> {
+        self.ensure_mutable()?;
+
+        if self.shutdown_in_progress {
+            return Err(WalError::ShutdownInProgress);
+        }
+
+        Ok(())
+    }
+
+    fn flush_inner(&mut self) -> Result<(), WalError> {
+        if self.active_segment.is_none() {
+            return Ok(());
+        }
+
+        self.drain_buffer(false)?;
+
+        if let Some(segment) = self.active_segment.as_mut() {
+            segment.file_mut().flush()?;
+        }
+
+        Ok(())
+    }
+
+    fn sync_inner(&mut self) -> Result<(), WalError> {
+        let bytes_synced = self
+            .next_lsn
+            .checked_distance_from(self.durable_lsn)
+            .ok_or(WalError::BrokenDurabilityContract)?;
+
+        let started = Instant::now();
+        self.flush_inner()?;
+
+        if let Some(segment) = self.active_segment.as_mut() {
+            segment.file_mut().sync()?;
+        }
+
+        self.durable_lsn = self.next_lsn;
+        self.metrics.note_sync(bytes_synced, started.elapsed());
 
         Ok(())
     }
