@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::{io, time::Instant};
 
 use crate::{
     config::{CompressionPolicy, RECORD_HEADER_LEN, SEGMENT_HEADER_LEN, SyncPolicy, WalConfig},
@@ -17,7 +17,10 @@ use crate::{
     lsn::Lsn,
     types::{RecordType, SegmentId, record_flags, record_types},
     wal::{
-        iterator::{WalIterator, WalRecord, read_record_at_snapshot, snapshot_segments},
+        iterator::{
+            SnapshotSegment, WalIterator, WalRecord, read_record_at_snapshot, snapshot_segments,
+            snapshot_segments_through,
+        },
         metrics::WalMetrics,
         recovery::{RecoveredWal, recover},
         report::RecoveryReport,
@@ -46,6 +49,7 @@ where
     checkpoint_state: CheckpointState,
     metrics: WalMetrics,
     shutdown_in_progress: bool,
+    fatal_state: Option<StickyFatalState>,
     _checksummer: C,
 }
 
@@ -65,6 +69,12 @@ impl SegmentSealPayload {
         put_u64_le(&mut buf, self.logical_bytes);
         buf
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StickyFatalState {
+    operation: &'static str,
+    safe_lsn: Lsn,
 }
 
 impl<D, C> Wal<D, C>
@@ -141,6 +151,8 @@ where
             checkpoint_state,
             metrics,
             shutdown_in_progress: false,
+            fatal_state: None,
+
             _checksummer: checksummer,
         };
 
@@ -294,6 +306,7 @@ where
 
     pub fn shutdown(&mut self) -> Result<(), WalError> {
         self.ensure_mutable()?;
+        self.ensure_not_fatal()?;
 
         if self.shutdown_in_progress {
             return Err(WalError::ShutdownInProgress);
@@ -333,12 +346,13 @@ where
         self.flush_inner()?;
         self.sync_inner()?;
 
-        publish_clean_shutdown(
+        if let Err(err) = publish_clean_shutdown(
             &self.control_store,
             self.config.identity,
             self.checkpoint_state,
-        )?;
-        self.metrics.note_clean_shutdown();
+        ) {
+            return Err(self.promote_mutating_error("publish clean shutdown control file", err));
+        }
 
         Ok(())
     }
@@ -402,13 +416,20 @@ where
         );
         header.finalize_checksum();
 
-        let file = self.directory.create_segment(NewSegment {
+        let file = match self.directory.create_segment(NewSegment {
             segment_id,
             base_lsn,
             header: header.clone(),
-        })?;
+        }) {
+            Ok(file) => file,
+            Err(source) => return Err(self.mark_sticky_fatal("create segment", source)),
+        };
 
-        let active_segment = ActiveSegment::open(file, header)?;
+        let active_segment = match ActiveSegment::open(file, header) {
+            Ok(segment) => segment,
+            Err(err) => return Err(self.promote_mutating_error("open new active segment", err)),
+        };
+
         self.current_wal_size = self
             .current_wal_size
             .checked_add(active_segment.file_len())
@@ -564,13 +585,23 @@ where
 
             let chunk_len = chunk.len() as u64;
 
-            {
+            let append_err = {
                 let active_segment = self
                     .active_segment
                     .as_mut()
                     .ok_or(WalError::BrokenDurabilityContract)?;
-                active_segment.file_mut().append_all(&chunk)?;
-                active_segment.note_bytes_written(chunk_len)?;
+
+                match active_segment.file_mut().append_all(&chunk) {
+                    Ok(()) => {
+                        active_segment.note_bytes_written(chunk_len)?;
+                        None
+                    }
+                    Err(source) => Some(source),
+                }
+            };
+
+            if let Some(source) = append_err {
+                return Err(self.mark_sticky_fatal("append wal bytes", source));
             }
 
             self.current_wal_size = self
@@ -677,14 +708,54 @@ where
         Ok(())
     }
 
+    fn ensure_not_fatal(&self) -> Result<(), WalError> {
+        if let Some(state) = self.fatal_state {
+            return Err(WalError::fatal_io(
+                state.operation,
+                io::Error::other("wal is in sticky fatal state; reopen required"),
+            ));
+        }
+
+        Ok(())
+    }
+
     fn ensure_operational(&self) -> Result<(), WalError> {
         self.ensure_mutable()?;
+        self.ensure_not_fatal()?;
 
         if self.shutdown_in_progress {
             return Err(WalError::ShutdownInProgress);
         }
 
         Ok(())
+    }
+
+    fn mark_sticky_fatal(&mut self, operation: &'static str, source: io::Error) -> WalError {
+        if self.fatal_state.is_none() {
+            self.fatal_state = Some(StickyFatalState {
+                operation,
+                safe_lsn: self.durable_lsn,
+            });
+        }
+
+        WalError::fatal_io(operation, source)
+    }
+
+    fn promote_mutating_error(&mut self, operation: &'static str, err: WalError) -> WalError {
+        match err {
+            WalError::Io(source) => self.mark_sticky_fatal(operation, source),
+            WalError::FatalIo { source, .. } => self.mark_sticky_fatal(operation, source),
+            other => other,
+        }
+    }
+
+    fn snapshot_readable_segments(&self) -> Result<Vec<SnapshotSegment<D::File>>, WalError> {
+        match self.fatal_state {
+            Some(state) => {
+                snapshot_segments_through(&self.directory, self.config.identity, state.safe_lsn)
+            }
+            None => snapshot_segments(&self.directory, self.config.identity),
+        }
     }
 
     fn flush_inner(&mut self) -> Result<(), WalError> {
@@ -695,7 +766,9 @@ where
         self.drain_buffer(false)?;
 
         if let Some(segment) = self.active_segment.as_mut() {
-            segment.file_mut().flush()?;
+            if let Err(source) = segment.file_mut().flush() {
+                return Err(self.mark_sticky_fatal("flush wal bytes", source));
+            }
         }
 
         Ok(())
@@ -711,7 +784,9 @@ where
         self.flush_inner()?;
 
         if let Some(segment) = self.active_segment.as_mut() {
-            segment.file_mut().sync()?;
+            if let Err(source) = segment.file_mut().sync() {
+                return Err(self.mark_sticky_fatal("sync wal segment", source));
+            }
         }
 
         self.durable_lsn = self.next_lsn;
@@ -751,12 +826,12 @@ where
     }
 
     pub fn read_at(&self, lsn: Lsn) -> Result<WalRecord, WalError> {
-        let segments = snapshot_segments(&self.directory, self.config.identity)?;
+        let segments = self.snapshot_readable_segments()?;
         read_record_at_snapshot(&segments, self.config.record_alignment, lsn)
     }
 
     pub fn iter_from(&self, from: Lsn) -> Result<WalIterator<D::File>, WalError> {
-        let segments = snapshot_segments(&self.directory, self.config.identity)?;
+        let segments = self.snapshot_readable_segments()?;
         WalIterator::new(segments, self.config.record_alignment, from)
     }
 }
@@ -817,9 +892,11 @@ fn buffer_error_to_wal(_: AppendBufferError) -> WalError {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
+        collections::BTreeMap,
+        fs, io,
         path::{Path, PathBuf},
         process,
+        sync::{Arc, Mutex},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -828,7 +905,7 @@ mod tests {
         config::SEGMENT_HEADER_LEN,
         format::record_header::RecordHeader,
         io::{
-            directory::{FsSegmentDirectory, SegmentDirectory},
+            directory::{FsSegmentDirectory, NewSegment, SegmentDirectory, SegmentMeta},
             segment_file::SegmentFile,
         },
         types::{WalIdentity, record_types},
@@ -879,6 +956,163 @@ mod tests {
         )
         .expect("failed to open test wal")
         .0
+    }
+
+    #[derive(Debug, Default)]
+    struct InjectedSegmentState {
+        bytes: Vec<u8>,
+        sync_calls: u64,
+        fail_sync_on_call: Option<u64>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct InjectedSegmentFile {
+        state: Arc<Mutex<InjectedSegmentState>>,
+    }
+
+    impl SegmentFile for InjectedSegmentFile {
+        fn len(&self) -> io::Result<u64> {
+            Ok(self.state.lock().unwrap().bytes.len() as u64)
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+            let state = self.state.lock().unwrap();
+            let start = offset as usize;
+
+            if start >= state.bytes.len() {
+                return Ok(0);
+            }
+
+            let end = (start + buf.len()).min(state.bytes.len());
+            let len = end - start;
+            buf[..len].copy_from_slice(&state.bytes[start..end]);
+            Ok(len)
+        }
+
+        fn append_all(&mut self, buf: &[u8]) -> io::Result<()> {
+            self.state.lock().unwrap().bytes.extend_from_slice(buf);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn sync(&mut self) -> io::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.sync_calls += 1;
+
+            if state.fail_sync_on_call == Some(state.sync_calls) {
+                return Err(io::Error::other("injected sync failure"));
+            }
+
+            Ok(())
+        }
+
+        fn truncate(&mut self, len: u64) -> io::Result<()> {
+            self.state.lock().unwrap().bytes.truncate(len as usize);
+            Ok(())
+        }
+
+        fn advise_sequential(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn prefetch(&self, _offset: u64, _len: u64) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct InjectedSegmentMeta {
+        base_lsn: Lsn,
+        state: Arc<Mutex<InjectedSegmentState>>,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct InjectedDirectory {
+        segments: Arc<Mutex<BTreeMap<SegmentId, InjectedSegmentMeta>>>,
+        fail_sync_on_segment: Option<SegmentId>,
+        fail_sync_on_call: u64,
+    }
+
+    impl InjectedDirectory {
+        fn with_sync_failure(segment_id: SegmentId, sync_call: u64) -> Self {
+            Self {
+                segments: Arc::new(Mutex::new(BTreeMap::new())),
+                fail_sync_on_segment: Some(segment_id),
+                fail_sync_on_call: sync_call,
+            }
+        }
+    }
+
+    impl SegmentDirectory for InjectedDirectory {
+        type File = InjectedSegmentFile;
+
+        fn list_segments(&self) -> io::Result<Vec<SegmentMeta>> {
+            let segments = self.segments.lock().unwrap();
+            let mut metas = segments
+                .iter()
+                .map(|(&segment_id, meta)| SegmentMeta {
+                    segment_id,
+                    base_lsn: meta.base_lsn,
+                    path: PathBuf::from(format!("segment-{segment_id}.wal")),
+                })
+                .collect::<Vec<_>>();
+
+            metas.sort_by_key(|meta| (meta.base_lsn, meta.segment_id));
+            Ok(metas)
+        }
+
+        fn create_segment(&self, spec: NewSegment) -> io::Result<Self::File> {
+            let mut state = InjectedSegmentState::default();
+            state.bytes.extend_from_slice(&spec.header.encode());
+
+            if self.fail_sync_on_segment == Some(spec.segment_id) {
+                state.fail_sync_on_call = Some(self.fail_sync_on_call);
+            }
+
+            let state = Arc::new(Mutex::new(state));
+            self.segments.lock().unwrap().insert(
+                spec.segment_id,
+                InjectedSegmentMeta {
+                    base_lsn: spec.base_lsn,
+                    state: state.clone(),
+                },
+            );
+
+            Ok(InjectedSegmentFile { state })
+        }
+
+        fn open_segment(&self, id: SegmentId) -> io::Result<Self::File> {
+            let meta = self
+                .segments
+                .lock()
+                .unwrap()
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing segment"))?;
+
+            Ok(InjectedSegmentFile { state: meta.state })
+        }
+
+        fn remove_segment(&self, id: SegmentId) -> io::Result<()> {
+            self.segments.lock().unwrap().remove(&id);
+            Ok(())
+        }
+
+        fn recycle_sgement(
+            &self,
+            old_id: SegmentId,
+            new_spec: NewSegment,
+        ) -> io::Result<Self::File> {
+            self.remove_segment(old_id)?;
+            self.create_segment(new_spec)
+        }
+
+        fn sync_directory(&self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -1032,5 +1266,82 @@ mod tests {
         assert_eq!(reopened.first_lsn(), Some(Lsn::ZERO));
         assert_eq!(reopened.next_lsn(), Lsn::new(37));
         assert_eq!(reopened.durable_lsn(), Lsn::new(37));
+    }
+
+    #[test]
+    fn failed_sync_enters_sticky_fatal_state_and_clamps_reads_to_durable_prefix() {
+        let test_dir = TestDir::new("sticky-fatal");
+        let directory = InjectedDirectory::with_sync_failure(1, 2);
+
+        let (mut wal, _report) = Wal::open(directory.clone(), test_dir.config(), ()).unwrap();
+
+        let first_lsn = wal
+            .append(RecordType::new(record_types::USER_MIN), b"first")
+            .unwrap();
+        wal.sync().unwrap();
+
+        let second_lsn = wal
+            .append(RecordType::new(record_types::USER_MIN), b"second")
+            .unwrap();
+
+        let sync_err = wal.sync().unwrap_err();
+        assert!(matches!(
+            sync_err,
+            WalError::FatalIo {
+                operation: "sync wal segment",
+                ..
+            }
+        ));
+
+        let append_err = wal
+            .append(RecordType::new(record_types::USER_MIN), b"third")
+            .unwrap_err();
+        let flush_err = wal.flush().unwrap_err();
+        let second_sync_err = wal.sync().unwrap_err();
+        let shutdown_err = wal.shutdown().unwrap_err();
+
+        assert!(matches!(
+            append_err,
+            WalError::FatalIo {
+                operation: "sync wal segment",
+                ..
+            }
+        ));
+        assert!(matches!(
+            flush_err,
+            WalError::FatalIo {
+                operation: "sync wal segment",
+                ..
+            }
+        ));
+        assert!(matches!(
+            second_sync_err,
+            WalError::FatalIo {
+                operation: "sync wal segment",
+                ..
+            }
+        ));
+        assert!(matches!(
+            shutdown_err,
+            WalError::FatalIo {
+                operation: "sync wal segment",
+                ..
+            }
+        ));
+
+        let first = wal.read_at(first_lsn).unwrap();
+        assert_eq!(first.payload, b"first");
+
+        let second_err = wal.read_at(second_lsn).unwrap_err();
+        assert!(matches!(
+            second_err,
+            WalError::LsnOutOfRange { lsn } if lsn == second_lsn
+        ));
+
+        let mut iter = wal.iter_from(first_lsn).unwrap();
+        let first_seen = iter.next().unwrap().unwrap();
+        assert_eq!(first_seen.lsn, first_lsn);
+        assert_eq!(first_seen.payload, b"first");
+        assert!(iter.next().unwrap().is_none());
     }
 }

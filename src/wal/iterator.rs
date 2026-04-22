@@ -175,6 +175,65 @@ pub(crate) fn snapshot_segments<D: SegmentDirectory>(
     Ok(segments)
 }
 
+pub(crate) fn snapshot_segments_through<D: SegmentDirectory>(
+    directory: &D,
+    expected_identity: WalIdentity,
+    end_lsn: Lsn,
+) -> Result<Vec<SnapshotSegment<D::File>>, WalError> {
+    let metas = directory.list_segments()?;
+    let mut segments = Vec::with_capacity(metas.len());
+    let mut previous_end_lsn = None;
+
+    for meta in metas {
+        if meta.base_lsn >= end_lsn {
+            break;
+        }
+
+        let file = directory.open_segment(meta.segment_id)?;
+        let header = read_segment_header(&file)?;
+
+        if header.segment_id != meta.segment_id || header.base_lsn != meta.base_lsn {
+            return Err(WalError::FilenameHeaderMismatch);
+        }
+
+        if header.identity() != expected_identity {
+            return Err(WalError::IdentityMismatch {
+                expected: expected_identity,
+                found: header.identity(),
+            });
+        }
+
+        let mut segment = SnapshotSegment::open(file, header)?;
+
+        if let Some(previous_end_lsn) = previous_end_lsn {
+            if segment.descriptor.base_lsn < previous_end_lsn {
+                return Err(WalError::SegmentOrderingViolation);
+            }
+        }
+
+        let segment_end_lsn = segment.descriptor.written_end_lsn()?;
+        if end_lsn < segment_end_lsn {
+            let retained_logical_len = end_lsn
+                .checked_distance_from(segment.descriptor.base_lsn)
+                .ok_or(WalError::BrokenDurabilityContract)?;
+            let retained_file_len = segment
+                .descriptor
+                .header_len
+                .checked_add(retained_logical_len)
+                .ok_or(WalError::ReservationOverflow)?;
+
+            segment.descriptor.set_file_len(retained_file_len)?;
+            segments.push(segment);
+            break;
+        }
+
+        previous_end_lsn = Some(segment_end_lsn);
+        segments.push(segment);
+    }
+
+    Ok(segments)
+}
+
 pub(crate) fn read_record_at_snapshot<F: SegmentFile>(
     segments: &[SnapshotSegment<F>],
     record_alignment: u32,
