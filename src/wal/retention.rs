@@ -4,18 +4,23 @@ use crate::{
     io::{directory::SegmentDirectory, segment_file::SegmentFile},
     lsn::Lsn,
     types::{SegmentId, WalIdentity},
-    wal::segment::SegmentDescriptor,
+    wal::{
+        retention_pin::{RetentionPinGuard, RetentionPinRegistry},
+        segment::SegmentDescriptor,
+    },
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct RetentionState {
     min_retention_lsn: Lsn,
+    pin_registry: RetentionPinRegistry,
 }
 
 impl Default for RetentionState {
     fn default() -> Self {
         Self {
             min_retention_lsn: Lsn::ZERO,
+            pin_registry: RetentionPinRegistry::default(),
         }
     }
 }
@@ -25,12 +30,32 @@ impl RetentionState {
         self.min_retention_lsn = lsn;
     }
 
+    pub fn acquire_pin(
+        &self,
+        holder_name: &str,
+        min_lsn: Lsn,
+    ) -> Result<RetentionPinGuard, WalError> {
+        self.pin_registry.acquire(holder_name, min_lsn)
+    }
+
+    pub fn active_pin_count(&self) -> usize {
+        self.pin_registry.active_pin_count()
+    }
+
     pub fn effective_floor(&self) -> Lsn {
-        self.min_retention_lsn
+        match self.pin_registry.min_pinned_lsn() {
+            Some(min_pinned_lsn) => self.min_retention_lsn.min(min_pinned_lsn),
+            None => self.min_retention_lsn,
+        }
     }
 
     pub fn requested_prune_floor(&self, requested_lsn: Lsn) -> Lsn {
-        requested_lsn.max(self.effective_floor())
+        let configured_floor = requested_lsn.max(self.min_retention_lsn);
+
+        match self.pin_registry.min_pinned_lsn() {
+            Some(min_pinned_lsn) => configured_floor.min(min_pinned_lsn),
+            None => configured_floor,
+        }
     }
 }
 
@@ -149,7 +174,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn requested_prune_floor_uses_the_more_aggressive_of_request_and_configured_floor() {
+    fn requested_prune_floor_uses_configured_floor_without_pins() {
         let mut state = RetentionState::default();
         state.set_min_retention_lsn(Lsn::new(200));
 
@@ -162,5 +187,32 @@ mod tests {
         let state = RetentionState::default();
 
         assert_eq!(state.effective_floor(), Lsn::ZERO);
+    }
+
+    #[test]
+    fn active_pin_lowers_effective_floor_until_released() {
+        let mut state = RetentionState::default();
+        state.set_min_retention_lsn(Lsn::new(500));
+
+        let pin = state.acquire_pin("tail", Lsn::new(200)).unwrap();
+
+        assert_eq!(state.effective_floor(), Lsn::new(200));
+        assert_eq!(state.active_pin_count(), 1);
+
+        drop(pin);
+
+        assert_eq!(state.effective_floor(), Lsn::new(500));
+        assert_eq!(state.active_pin_count(), 0);
+    }
+
+    #[test]
+    fn requested_prune_floor_never_moves_past_oldest_active_pin() {
+        let mut state = RetentionState::default();
+        state.set_min_retention_lsn(Lsn::new(200));
+
+        let _pin = state.acquire_pin("tail", Lsn::new(120)).unwrap();
+
+        assert_eq!(state.requested_prune_floor(Lsn::new(300)), Lsn::new(120));
+        assert_eq!(state.requested_prune_floor(Lsn::new(150)), Lsn::new(120));
     }
 }
