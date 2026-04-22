@@ -25,6 +25,7 @@ use crate::{
         recovery::{RecoveredWal, recover},
         report::RecoveryReport,
         retention::{RetentionState, execute_truncate_plan, plan_truncate_segments_before},
+        retention_pin::RetentionPinGuard,
         segment::ActiveSegment,
         shutdown::{
             CheckpointState, clear_clean_shutdown, find_shutdown_tail, publish_clean_shutdown,
@@ -361,13 +362,24 @@ where
     }
 
     pub fn metrics(&self) -> WalMetrics {
-        self.metrics.clone()
+        let mut metrics = self.metrics.clone();
+        metrics.set_retention_pins_active(self.retention_state.active_pin_count());
+        metrics
     }
 
     pub fn set_min_retention_lsn(&mut self, lsn: Lsn) -> Result<(), WalError> {
         self.ensure_operational()?;
         self.retention_state.set_min_retention_lsn(lsn);
         Ok(())
+    }
+
+    pub fn acquire_retention_pin(
+        &self,
+        holder_name: &str,
+        min_lsn: Lsn,
+    ) -> Result<RetentionPinGuard, WalError> {
+        self.ensure_operational()?;
+        self.retention_state.acquire_pin(holder_name, min_lsn)
     }
 
     pub fn truncate_segments_before(&mut self, lsn: Lsn) -> Result<usize, WalError> {
