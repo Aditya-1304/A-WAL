@@ -24,6 +24,7 @@ use crate::{
         metrics::WalMetrics,
         recovery::{RecoveredWal, recover},
         report::RecoveryReport,
+        retention::{RetentionState, execute_truncate_plan, plan_truncate_segments_before},
         segment::ActiveSegment,
         shutdown::{
             CheckpointState, clear_clean_shutdown, find_shutdown_tail, publish_clean_shutdown,
@@ -47,6 +48,7 @@ where
     next_segment_id: SegmentId,
     active_segment_record_count: u64,
     checkpoint_state: CheckpointState,
+    retention_state: RetentionState,
     metrics: WalMetrics,
     shutdown_in_progress: bool,
     fatal_state: Option<StickyFatalState>,
@@ -149,6 +151,7 @@ where
             next_segment_id,
             active_segment_record_count,
             checkpoint_state,
+            retention_state: RetentionState::default(),
             metrics,
             shutdown_in_progress: false,
             fatal_state: None,
@@ -359,6 +362,47 @@ where
 
     pub fn metrics(&self) -> WalMetrics {
         self.metrics.clone()
+    }
+
+    pub fn set_min_retention_lsn(&mut self, lsn: Lsn) -> Result<(), WalError> {
+        self.ensure_operational()?;
+        self.retention_state.set_min_retention_lsn(lsn);
+        Ok(())
+    }
+
+    pub fn truncate_segments_before(&mut self, lsn: Lsn) -> Result<usize, WalError> {
+        self.ensure_operational()?;
+
+        let floor_lsn = self.retention_state.requested_prune_floor(lsn);
+        let plan = match plan_truncate_segments_before(
+            &self.directory,
+            self.config.identity,
+            self.active_segment_id(),
+            floor_lsn,
+        ) {
+            Ok(plan) => plan,
+            Err(err) => {
+                return Err(self.promote_mutating_error("plan wal retention truncation", err));
+            }
+        };
+
+        if plan.removable_segment_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let removed = match execute_truncate_plan(&self.directory, &plan) {
+            Ok(removed) => removed,
+            Err(err) => return Err(self.promote_mutating_error("truncate wal segments", err)),
+        };
+
+        self.current_wal_size = self
+            .current_wal_size
+            .checked_sub(plan.removed_bytes)
+            .ok_or(WalError::BrokenDurabilityContract)?;
+        self.metrics.set_current_wal_size(self.current_wal_size);
+        self.first_lsn = self.recompute_first_lsn_after_prune(plan.first_remaining_lsn);
+
+        Ok(removed)
     }
 
     pub fn next_lsn(&self) -> Lsn {
@@ -756,6 +800,21 @@ where
             }
             None => snapshot_segments(&self.directory, self.config.identity),
         }
+    }
+
+    fn recompute_first_lsn_after_prune(
+        &self,
+        planned_first_remaining_lsn: Option<Lsn>,
+    ) -> Option<Lsn> {
+        planned_first_remaining_lsn.or_else(|| {
+            let active_segment = self.active_segment.as_ref()?;
+
+            if active_segment.written_logical_len() > 0 || !self.write_buffer.is_empty() {
+                Some(active_segment.base_lsn())
+            } else {
+                None
+            }
+        })
     }
 
     fn flush_inner(&mut self) -> Result<(), WalError> {
