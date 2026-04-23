@@ -15,7 +15,7 @@ use crate::{
         segment_file::SegmentFile,
     },
     lsn::Lsn,
-    types::{RecordType, SegmentId, record_flags, record_types},
+    types::{RecordType, SegmentId, WalIdentity, record_flags, record_types},
     wal::{
         iterator::{
             SnapshotSegment, WalIterator, WalRecord, read_record_at_snapshot, snapshot_segments,
@@ -462,6 +462,25 @@ where
         self.active_segment
             .as_ref()
             .map(|segment| segment.segment_id())
+    }
+
+    pub(crate) fn cloned_directory(&self) -> D
+    where
+        D: Clone,
+    {
+        self.directory.clone()
+    }
+
+    pub(crate) fn identity(&self) -> WalIdentity {
+        self.config.identity
+    }
+
+    pub(crate) fn record_alignment(&self) -> u32 {
+        self.config.record_alignment
+    }
+
+    pub(crate) fn readable_cap_lsn(&self) -> Option<Lsn> {
+        self.fatal_state.map(|state| state.safe_lsn)
     }
 
     fn ensure_record_admission_within_wal_size_limit(
