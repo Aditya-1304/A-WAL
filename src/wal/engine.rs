@@ -22,7 +22,8 @@ use crate::{
             snapshot_segments_through,
         },
         metrics::WalMetrics,
-        recovery::{RecoveredWal, recover},
+        recovery::{RecoveredWal, recover_with_observer},
+        recovery_observer::RecoveryObserver,
         report::RecoveryReport,
         retention::{RetentionState, execute_truncate_plan, plan_truncate_segments_before},
         retention_pin::RetentionPinGuard,
@@ -89,6 +90,24 @@ where
         config: WalConfig,
         checksummer: C,
     ) -> Result<(Self, RecoveryReport), WalError> {
+        Self::open_internal(directory, config, checksummer, None)
+    }
+
+    pub fn open_with_observer(
+        directory: D,
+        config: WalConfig,
+        checksummer: C,
+        observer: &dyn RecoveryObserver,
+    ) -> Result<(Self, RecoveryReport), WalError> {
+        Self::open_internal(directory, config, checksummer, Some(observer))
+    }
+
+    fn open_internal(
+        directory: D,
+        config: WalConfig,
+        checksummer: C,
+        observer: Option<&dyn RecoveryObserver>,
+    ) -> Result<(Self, RecoveryReport), WalError> {
         config.validate()?;
         Self::validate_constraints(&config)?;
 
@@ -103,10 +122,10 @@ where
             Some(control) => {
                 match Self::try_open_clean_shutdown_fast_path(&directory, &config, control)? {
                     Some(recovered) => recovered,
-                    None => recover(&directory, &control_store, &config)?,
+                    None => recover_with_observer(&directory, &control_store, &config, observer)?,
                 }
             }
-            None => recover(&directory, &control_store, &config)?,
+            None => recover_with_observer(&directory, &control_store, &config, observer)?,
         };
 
         let RecoveredWal {
@@ -156,7 +175,6 @@ where
             metrics,
             shutdown_in_progress: false,
             fatal_state: None,
-
             _checksummer: checksummer,
         };
 

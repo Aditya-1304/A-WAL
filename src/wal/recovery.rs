@@ -15,6 +15,7 @@ use crate::{
     lsn::Lsn,
     types::{RecordType, SegmentId, record_types},
     wal::{
+        recovery_observer::{RecoveryCallbacks, RecoveryObserver},
         report::RecoveryReport,
         segment::{ActiveSegment, SegmentDescriptor},
     },
@@ -43,6 +44,7 @@ struct SegmentScanResult {
     valid_end_offset: u64,
     record_count: u64,
     last_valid_record_type: Option<RecordType>,
+    tail_error_lsn: Option<Lsn>,
     tail_error: Option<WalError>,
 }
 
@@ -57,10 +59,26 @@ pub fn recover<D: SegmentDirectory>(
     control_store: &FsControlFileStore,
     config: &WalConfig,
 ) -> Result<RecoveredWal<D::File>, WalError> {
+    recover_with_observer(directory, control_store, config, None)
+}
+
+pub(crate) fn recover_with_observer<D: SegmentDirectory>(
+    directory: &D,
+    control_store: &FsControlFileStore,
+    config: &WalConfig,
+    observer: Option<&dyn RecoveryObserver>,
+) -> Result<RecoveredWal<D::File>, WalError> {
+    let observer = RecoveryCallbacks::new(observer);
     let started = Instant::now();
     let mut report = RecoveryReport::empty();
 
     let control = control_store.load_for_recovery(config.identity)?;
+    let control_checkpoint = control.as_ref().and_then(|control| {
+        control
+            .last_checkpoint_lsn
+            .map(|lsn| (lsn, control.checkpoint_no))
+    });
+
     report.mark_clean_shutdown(
         control
             .as_ref()
@@ -101,6 +119,8 @@ pub fn recover<D: SegmentDirectory>(
             &mut report,
             &mut checkpoint_lsns,
             previous_end_lsn,
+            control_checkpoint,
+            observer,
         )?;
 
         let Some(recovered) = recovered else {
@@ -155,7 +175,6 @@ pub fn recover<D: SegmentDirectory>(
         report,
     })
 }
-
 fn recover_segment<D: SegmentDirectory>(
     directory: &D,
     meta: &SegmentMeta,
@@ -164,7 +183,11 @@ fn recover_segment<D: SegmentDirectory>(
     report: &mut RecoveryReport,
     checkpoint_lsns: &mut BTreeSet<Lsn>,
     previous_end_lsn: Option<Lsn>,
+    control_checkpoint: Option<(Lsn, u64)>,
+    observer: RecoveryCallbacks<'_>,
 ) -> Result<Option<RecoveredSegment<D::File>>, WalError> {
+    observer.on_segment_start(meta.segment_id, meta.base_lsn);
+
     let mut file = directory.open_segment(meta.segment_id)?;
     let original_file_len = file.len()?;
 
@@ -181,6 +204,7 @@ fn recover_segment<D: SegmentDirectory>(
                 report,
                 original_file_len,
                 err,
+                observer,
             );
         }
     };
@@ -213,9 +237,13 @@ fn recover_segment<D: SegmentDirectory>(
         config.record_alignment,
         checkpoint_lsns,
         report,
+        control_checkpoint,
+        observer,
     )?;
 
     if let Some(err) = scan.tail_error {
+        let corruption_lsn = scan.tail_error_lsn.unwrap_or(descriptor.base_lsn);
+        observer.on_corruption_found(corruption_lsn, &err);
         report.note_corruption();
 
         if !is_latest {
@@ -238,6 +266,7 @@ fn recover_segment<D: SegmentDirectory>(
         file.truncate(scan.valid_end_offset)?;
         file.sync()?;
         descriptor.set_file_len(scan.valid_end_offset)?;
+        observer.on_truncation(corruption_lsn, truncated_bytes);
         report.note_truncation(truncated_bytes);
     }
 
@@ -249,7 +278,6 @@ fn recover_segment<D: SegmentDirectory>(
         last_valid_record_type: scan.last_valid_record_type,
     }))
 }
-
 fn handle_invalid_newest_header<D: SegmentDirectory>(
     directory: &D,
     meta: &SegmentMeta,
@@ -258,7 +286,10 @@ fn handle_invalid_newest_header<D: SegmentDirectory>(
     report: &mut RecoveryReport,
     original_file_len: u64,
     err: WalError,
+    observer: RecoveryCallbacks<'_>,
 ) -> Result<Option<RecoveredSegment<D::File>>, WalError> {
+    observer.on_corruption_found(meta.base_lsn, &err);
+
     if !is_latest {
         return Err(WalError::CorruptionInSealedSegment);
     }
@@ -274,6 +305,7 @@ fn handle_invalid_newest_header<D: SegmentDirectory>(
     }
 
     directory.remove_segment(meta.segment_id)?;
+    observer.on_truncation(meta.base_lsn, original_file_len);
     report.note_truncation(original_file_len);
 
     Ok(None)
@@ -287,6 +319,8 @@ fn scan_segment<F: SegmentFile>(
     record_alignment: u32,
     checkpoint_lsns: &mut BTreeSet<Lsn>,
     report: &mut RecoveryReport,
+    control_checkpoint: Option<(Lsn, u64)>,
+    observer: RecoveryCallbacks<'_>,
 ) -> Result<SegmentScanResult, WalError> {
     let mut file_offset = descriptor.header_len;
     let mut expected_lsn = descriptor.base_lsn;
@@ -305,9 +339,14 @@ fn scan_segment<F: SegmentFile>(
         ) {
             Ok(record) => {
                 report.note_record_scanned(record.header.lsn);
+                observer.on_records_scanned(report.records_scanned, record.header.lsn);
 
                 if record.header.record_type == record_types::END_CHECKPOINT {
                     checkpoint_lsns.insert(record.header.lsn);
+                    observer.on_checkpoint_found(
+                        record.header.lsn,
+                        observed_checkpoint_no(control_checkpoint, record.header.lsn),
+                    );
                 }
 
                 record_count = record_count
@@ -322,6 +361,7 @@ fn scan_segment<F: SegmentFile>(
                     valid_end_offset: file_offset,
                     record_count,
                     last_valid_record_type,
+                    tail_error_lsn: Some(expected_lsn),
                     tail_error: Some(err),
                 });
             }
@@ -332,6 +372,7 @@ fn scan_segment<F: SegmentFile>(
         valid_end_offset: file_offset,
         record_count,
         last_valid_record_type,
+        tail_error_lsn: None,
         tail_error: None,
     })
 }
@@ -432,6 +473,13 @@ fn select_checkpoint_lsn(
     }
 
     checkpoint_lsns.last().copied()
+}
+
+fn observed_checkpoint_no(control_checkpoint: Option<(Lsn, u64)>, checkpoint_lsn: Lsn) -> u64 {
+    match control_checkpoint {
+        Some((control_lsn, checkpoint_no)) if control_lsn == checkpoint_lsn => checkpoint_no,
+        _ => 0,
+    }
 }
 
 fn physical_record_len(record_alignment: u32, total_len: usize) -> Result<usize, WalError> {
