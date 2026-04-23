@@ -377,6 +377,8 @@ where
             return Err(self.promote_mutating_error("publish clean shutdown control file", err));
         }
 
+        self.metrics.note_clean_shutdown();
+
         Ok(())
     }
 
