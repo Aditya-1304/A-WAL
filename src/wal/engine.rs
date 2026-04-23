@@ -268,11 +268,12 @@ where
             });
         }
 
-        self.ensure_writable_segment()?;
-
         let original_payload_len = payload.len() as u64;
         let (on_disk_payload, flags) = self.prepare_payload_for_append(payload)?;
         let record_bytes = self.record_physical_len_for_payload_len(on_disk_payload.len())? as u64;
+
+        self.ensure_record_admission_within_wal_size_limit(record_bytes, true)?;
+
         let lsn = self.stage_record(record_type, flags, &on_disk_payload, true)?;
 
         self.active_segment_record_count = self
@@ -441,6 +442,66 @@ where
         self.active_segment
             .as_ref()
             .map(|segment| segment.segment_id())
+    }
+
+    fn ensure_record_admission_within_wal_size_limit(
+        &self,
+        record_len: u64,
+        reserve_future_seal_space: bool,
+    ) -> Result<(), WalError> {
+        let Some(limit) = self.config.max_wal_size else {
+            return Ok(());
+        };
+
+        let current_admitted_size = self
+            .current_wal_size
+            .checked_add(self.write_buffer.len() as u64)
+            .ok_or(WalError::ReservationOverflow)?;
+
+        let projected_growth =
+            self.predicted_record_admission_growth(record_len, reserve_future_seal_space)?;
+        let projected_size = current_admitted_size
+            .checked_add(projected_growth)
+            .ok_or(WalError::ReservationOverflow)?;
+
+        if projected_size > limit {
+            return Err(WalError::WalSizeLimitExceeded {
+                current: projected_size,
+                limit,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn predicted_record_admission_growth(
+        &self,
+        record_len: u64,
+        reserve_future_seal_space: bool,
+    ) -> Result<u64, WalError> {
+        let mut growth = record_len;
+
+        match self.active_segment.as_ref() {
+            None => {
+                growth = growth
+                    .checked_add(SEGMENT_HEADER_LEN)
+                    .ok_or(WalError::ReservationOverflow)?;
+            }
+            Some(_)
+                if reserve_future_seal_space
+                    && !self.active_segment_can_fit(record_len, true)? =>
+            {
+                if !self.active_segment_is_empty() {
+                    growth = growth
+                        .checked_add(self.seal_record_physical_len()? as u64)
+                        .and_then(|value| value.checked_add(SEGMENT_HEADER_LEN))
+                        .ok_or(WalError::ReservationOverflow)?;
+                }
+            }
+            Some(_) => {}
+        }
+
+        Ok(growth)
     }
 
     fn ensure_writable_segment(&mut self) -> Result<(), WalError> {
