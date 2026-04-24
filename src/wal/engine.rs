@@ -81,6 +81,43 @@ struct StickyFatalState {
     safe_lsn: Lsn,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReservationSnapshot {
+    pub next_lsn: Lsn,
+    pub active_segment_id: Option<SegmentId>,
+    pub active_segment_len: u64,
+    pub active_buffer_len: usize,
+    pub segment_count: usize,
+}
+
+#[derive(Debug)]
+struct PreparedReservationRecord {
+    record_type: RecordType,
+    provisional_lsn: Lsn,
+    original_payload_len: u64,
+    on_disk_payload: Vec<u8>,
+    flags: u16,
+    record_bytes: u64,
+}
+
+pub struct WalReservation<'a, D, C>
+where
+    D: SegmentDirectory,
+{
+    wal: &'a mut Wal<D, C>,
+    snapshot: ReservationSnapshot,
+    base_lsn: Lsn,
+    total_reserved_bytes: usize,
+    reserved_payload_bytes: usize,
+    payload_bytes_written: usize,
+    encoded_bytes_written: usize,
+    provisional_next_lsn: Lsn,
+    prepared: Vec<PreparedReservationRecord>,
+    records_written: usize,
+    expected_count: usize,
+    finished: bool,
+}
+
 impl<D, C> Wal<D, C>
 where
     D: SegmentDirectory,
@@ -417,6 +454,38 @@ where
         Ok(lsns)
     }
 
+    pub fn reserve(
+        &mut self,
+        count: usize,
+        total_payload_bytes: usize,
+    ) -> Result<WalReservation<'_, D, C>, WalError> {
+        self.ensure_operational()?;
+
+        if count == 0 && total_payload_bytes > 0 {
+            return Err(WalError::ReservationOverflow);
+        }
+
+        let snapshot = self.capture_reservation_snapshot()?;
+        let base_lsn = snapshot.next_lsn;
+        let total_reserved_bytes =
+            self.reservation_upper_bound_bytes(count, total_payload_bytes)?;
+
+        Ok(WalReservation {
+            wal: self,
+            snapshot,
+            base_lsn,
+            total_reserved_bytes,
+            reserved_payload_bytes: total_payload_bytes,
+            payload_bytes_written: 0,
+            encoded_bytes_written: 0,
+            provisional_next_lsn: base_lsn,
+            prepared: Vec::with_capacity(count),
+            records_written: 0,
+            expected_count: count,
+            finished: false,
+        })
+    }
+
     pub fn flush(&mut self) -> Result<(), WalError> {
         self.ensure_operational()?;
         self.flush_inner()
@@ -581,6 +650,45 @@ where
 
     pub(crate) fn readable_cap_lsn(&self) -> Option<Lsn> {
         self.fatal_state.map(|state| state.safe_lsn)
+    }
+
+    fn capture_reservation_snapshot(&self) -> Result<ReservationSnapshot, WalError> {
+        let segment_count = self.directory.list_segments()?.len();
+
+        Ok(ReservationSnapshot {
+            next_lsn: self.next_lsn,
+            active_segment_id: self
+                .active_segment
+                .as_ref()
+                .map(|segment| segment.segment_id()),
+            active_segment_len: self
+                .active_segment
+                .as_ref()
+                .map(|segment| segment.file_len())
+                .unwrap_or(0),
+            active_buffer_len: self.write_buffer.len(),
+            segment_count,
+        })
+    }
+
+    fn reservation_upper_bound_bytes(
+        &self,
+        count: usize,
+        total_payload_bytes: usize,
+    ) -> Result<usize, WalError> {
+        let max_padding_per_record = match self.config.record_alignment {
+            0 => 0usize,
+            alignment => alignment as usize - 1,
+        };
+
+        let per_record_overhead = RECORD_HEADER_LEN
+            .checked_add(max_padding_per_record)
+            .ok_or(WalError::ReservationOverflow)?;
+
+        count
+            .checked_mul(per_record_overhead)
+            .and_then(|overhead| overhead.checked_add(total_payload_bytes))
+            .ok_or(WalError::ReservationOverflow)
     }
 
     fn ensure_record_admission_within_wal_size_limit(
@@ -1211,6 +1319,221 @@ where
     pub fn iter_from(&self, from: Lsn) -> Result<WalIterator<D::File>, WalError> {
         let segments = self.snapshot_readable_segments()?;
         WalIterator::new(segments, self.config.record_alignment, from)
+    }
+}
+
+impl<'a, D, C> WalReservation<'a, D, C>
+where
+    D: SegmentDirectory,
+{
+    pub fn snapshot(&self) -> ReservationSnapshot {
+        self.snapshot
+    }
+
+    pub fn base_lsn(&self) -> Lsn {
+        self.base_lsn
+    }
+
+    pub fn append(&mut self, record_type: RecordType, payload: &[u8]) -> Result<Lsn, WalError> {
+        if self.finished || self.records_written >= self.expected_count {
+            return Err(WalError::ReservationOverflow);
+        }
+
+        let next_payload_bytes = self
+            .payload_bytes_written
+            .checked_add(payload.len())
+            .ok_or(WalError::ReservationOverflow)?;
+        if next_payload_bytes > self.reserved_payload_bytes {
+            return Err(WalError::ReservationOverflow);
+        }
+
+        if payload.len() > self.wal.config.max_record_size as usize {
+            return Err(WalError::PayloadTooLarge {
+                len: payload.len() as u32,
+                max: self.wal.config.max_record_size,
+            });
+        }
+
+        let original_payload_len = payload.len() as u64;
+        let (on_disk_payload, flags) = self.wal.prepare_payload_for_append(payload)?;
+        let record_bytes =
+            self.wal
+                .record_physical_len_for_payload_len(on_disk_payload.len())? as u64;
+
+        let next_encoded_bytes = self
+            .encoded_bytes_written
+            .checked_add(usize::try_from(record_bytes).map_err(|_| WalError::ReservationOverflow)?)
+            .ok_or(WalError::ReservationOverflow)?;
+        if next_encoded_bytes > self.total_reserved_bytes {
+            return Err(WalError::ReservationOverflow);
+        }
+
+        let provisional_lsn = self.provisional_next_lsn;
+        self.provisional_next_lsn = self
+            .provisional_next_lsn
+            .checked_add_bytes(record_bytes)
+            .ok_or(WalError::ReservationOverflow)?;
+
+        self.payload_bytes_written = next_payload_bytes;
+        self.encoded_bytes_written = next_encoded_bytes;
+        self.records_written = self
+            .records_written
+            .checked_add(1)
+            .ok_or(WalError::ReservationOverflow)?;
+
+        self.prepared.push(PreparedReservationRecord {
+            record_type,
+            provisional_lsn,
+            original_payload_len,
+            on_disk_payload,
+            flags,
+            record_bytes,
+        });
+
+        Ok(provisional_lsn)
+    }
+
+    pub fn commit(mut self) -> Result<Vec<Lsn>, WalError> {
+        if self.expected_count == 0 {
+            self.finished = true;
+            return Ok(Vec::new());
+        }
+
+        if self.records_written != self.expected_count {
+            return Err(WalError::ReservationOverflow);
+        }
+
+        self.wal.ensure_operational()?;
+        if !self.snapshot_matches() {
+            self.finished = true;
+            return Err(WalError::BrokenDurabilityContract);
+        }
+
+        let record_lens = self
+            .prepared
+            .iter()
+            .map(|record| record.record_bytes)
+            .collect::<Vec<_>>();
+        self.wal.preflight_batch_append(&record_lens, true)?;
+
+        self.finished = true;
+
+        let prepared = std::mem::take(&mut self.prepared);
+        let mut lsns = Vec::with_capacity(prepared.len());
+        let mut appended_records = 0u64;
+        let mut appended_bytes = 0u64;
+
+        for record in prepared {
+            let lsn = match self.wal.stage_record(
+                record.record_type,
+                record.flags,
+                &record.on_disk_payload,
+                true,
+            ) {
+                Ok(lsn) => lsn,
+                Err(err) => {
+                    if appended_records > 0 {
+                        self.wal
+                            .metrics
+                            .note_appended_records(appended_records, appended_bytes);
+                    }
+                    return Err(err);
+                }
+            };
+
+            self.wal.active_segment_record_count = self
+                .wal
+                .active_segment_record_count
+                .checked_add(1)
+                .ok_or(WalError::ReservationOverflow)?;
+
+            if self.wal.first_lsn.is_none() {
+                self.wal.first_lsn = Some(lsn);
+            }
+
+            appended_records = appended_records
+                .checked_add(1)
+                .ok_or(WalError::ReservationOverflow)?;
+            appended_bytes = appended_bytes
+                .checked_add(record.record_bytes)
+                .ok_or(WalError::ReservationOverflow)?;
+
+            if record.flags & record_flags::COMPRESSED != 0 {
+                self.wal.metrics.note_compression(
+                    record.original_payload_len,
+                    record.on_disk_payload.len() as u64,
+                );
+            }
+
+            if lsn != record.provisional_lsn {
+                self.wal
+                    .metrics
+                    .note_appended_records(appended_records, appended_bytes);
+                return Err(WalError::NonMonotonicLsn {
+                    expected: record.provisional_lsn,
+                    found: lsn,
+                });
+            }
+
+            lsns.push(lsn);
+        }
+
+        self.wal
+            .metrics
+            .note_batch_append(appended_records, appended_bytes);
+
+        if matches!(self.wal.config.sync_policy, SyncPolicy::Always) {
+            self.wal.sync()?;
+        }
+
+        Ok(lsns)
+    }
+
+    pub fn abort(mut self) -> Result<(), WalError> {
+        self.finish_without_commit()
+    }
+
+    fn finish_without_commit(&mut self) -> Result<(), WalError> {
+        if self.finished {
+            return Ok(());
+        }
+
+        let snapshot_matches = self.snapshot_matches();
+        self.prepared.clear();
+        self.finished = true;
+
+        if snapshot_matches {
+            Ok(())
+        } else {
+            Err(WalError::BrokenDurabilityContract)
+        }
+    }
+
+    fn snapshot_matches(&self) -> bool {
+        self.wal.next_lsn == self.snapshot.next_lsn
+            && self.wal.write_buffer.len() == self.snapshot.active_buffer_len
+            && self
+                .wal
+                .active_segment
+                .as_ref()
+                .map(|segment| segment.segment_id())
+                == self.snapshot.active_segment_id
+            && self
+                .wal
+                .active_segment
+                .as_ref()
+                .map(|segment| segment.file_len())
+                .unwrap_or(0)
+                == self.snapshot.active_segment_len
+    }
+}
+
+impl<'a, D, C> Drop for WalReservation<'a, D, C>
+where
+    D: SegmentDirectory,
+{
+    fn drop(&mut self) {
+        let _ = self.finish_without_commit();
     }
 }
 
