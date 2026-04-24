@@ -27,7 +27,7 @@ where
     D: SegmentDirectory,
 {
     inner: Arc<Mutex<Wal<D, C>>>,
-    sync_state: Arc<SyncCoordinator>,
+    sync_state: Arc<(Mutex<SyncCoordinator>, Condvar)>,
     tail_state: Arc<(Mutex<TailCoordinator>, Condvar)>,
 }
 
@@ -107,7 +107,10 @@ where
 
         Self {
             inner: Arc::new(Mutex::new(wal)),
-            sync_state: Arc::new(SyncCoordinator::new(durable_lsn)),
+            sync_state: Arc::new((
+                Mutex::new(SyncCoordinator::new(durable_lsn)),
+                Condvar::new(),
+            )),
             tail_state: Arc::new((Mutex::new(TailCoordinator::default()), Condvar::new())),
         }
     }
@@ -148,31 +151,56 @@ where
     }
 
     pub fn sync_through(&self, lsn: Lsn) -> Result<(), WalError> {
-        if self.sync_state.durable_lsn() >= lsn {
+        let (lock, condvar) = &*self.sync_state;
+
+        let mut coordinator = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if coordinator.durable_lsn() >= lsn {
             return Ok(());
         }
 
-        let mut wal = self.lock();
+        coordinator.add_waiter(lsn);
 
-        if wal.durable_lsn() >= lsn {
-            self.publish_locked_durable_lsn(&wal);
-            return Ok(());
-        }
+        loop {
+            if coordinator.durable_lsn() >= lsn {
+                coordinator.remove_waiter();
+                return Ok(());
+            }
 
-        if wal.next_lsn() < lsn {
-            return Err(WalError::LsnOutOfRange { lsn });
-        }
+            if coordinator.sync_in_flight {
+                coordinator = condvar
+                    .wait(coordinator)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                continue;
+            }
 
-        let result = wal.sync();
-        self.publish_locked_durable_lsn(&wal);
-        drop(wal);
-        self.notify_tailers();
-        result?;
+            let requested_lsn = coordinator.requested_lsn.unwrap_or(lsn);
+            coordinator.begin_sync();
 
-        if self.sync_state.durable_lsn() >= lsn {
-            Ok(())
-        } else {
-            Err(WalError::BrokenDurabilityContract)
+            drop(coordinator);
+
+            let sync_result = self.perform_group_sync(lsn, requested_lsn);
+
+            coordinator = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            match sync_result {
+                Ok(durable_lsn) => {
+                    coordinator.finish_sync_success(durable_lsn);
+                    condvar.notify_all();
+                }
+                Err(WalError::LsnOutOfRange { lsn }) => {
+                    coordinator.finish_sync_without_error();
+                    coordinator.remove_waiter();
+                    condvar.notify_all();
+                    return Err(WalError::LsnOutOfRange { lsn });
+                }
+                Err(error) => {
+                    coordinator.finish_sync_error(&error);
+                    coordinator.remove_waiter();
+                    condvar.notify_all();
+                    return Err(error);
+                }
+            }
         }
     }
 
@@ -208,7 +236,11 @@ where
     }
 
     pub fn durable_lsn(&self) -> Lsn {
-        self.sync_state.durable_lsn()
+        let (lock, _) = &*self.sync_state;
+
+        lock.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .durable_lsn()
     }
 
     pub fn set_min_retention_lsn(&self, lsn: Lsn) -> Result<(), WalError> {
@@ -265,7 +297,39 @@ where
     }
 
     fn publish_locked_durable_lsn(&self, wal: &Wal<D, C>) {
-        self.sync_state.publish_durable_lsn(wal.durable_lsn());
+        let (lock, condvar) = &*self.sync_state;
+
+        let mut coordinator = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        coordinator.publish_durable_lsn(wal.durable_lsn());
+
+        drop(coordinator);
+
+        condvar.notify_all();
+    }
+
+    fn perform_group_sync(&self, own_lsn: Lsn, requested_lsn: Lsn) -> Result<Lsn, WalError> {
+        let mut wal = self.lock();
+
+        if wal.durable_lsn() >= own_lsn {
+            return Ok(wal.durable_lsn());
+        }
+
+        if wal.next_lsn() < own_lsn {
+            return Err(WalError::LsnOutOfRange { lsn: own_lsn });
+        }
+
+        let sync_target = requested_lsn.min(wal.next_lsn());
+
+        wal.sync()?;
+
+        let durable_lsn = wal.durable_lsn();
+
+        if durable_lsn < sync_target {
+            return Err(WalError::BrokenDurabilityContract);
+        }
+
+        Ok(durable_lsn)
     }
 
     fn tail_snapshot_plan(&self) -> Result<TailSnapshotPlan<D>, WalError> {
