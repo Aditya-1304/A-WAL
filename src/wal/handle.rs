@@ -16,6 +16,7 @@ use crate::{
         recovery_observer::RecoveryObserver,
         report::RecoveryReport,
         retention_pin::RetentionPinGuard,
+        sync_coordinator::SyncCoordinator,
     },
 };
 
@@ -24,6 +25,7 @@ where
     D: SegmentDirectory,
 {
     inner: Arc<Mutex<Wal<D, C>>>,
+    sync_state: Arc<SyncCoordinator>,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +43,7 @@ where
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            sync_state: Arc::clone(&self.sync_state),
         }
     }
 }
@@ -62,8 +65,11 @@ where
     D: SegmentDirectory + Clone,
 {
     pub fn new(wal: Wal<D, C>) -> Self {
+        let durable_lsn = wal.durable_lsn();
+
         Self {
             inner: Arc::new(Mutex::new(wal)),
+            sync_state: Arc::new(SyncCoordinator::new(durable_lsn)),
         }
     }
 
@@ -87,25 +93,30 @@ where
     }
 
     pub fn append(&self, record_type: RecordType, payload: &[u8]) -> Result<Lsn, WalError> {
-        self.lock().append(record_type, payload)
+        self.with_wal_mut(|wal| wal.append(record_type, payload))
     }
 
     pub fn append_batch(&self, records: &[(RecordType, &[u8])]) -> Result<Vec<Lsn>, WalError> {
-        self.lock().append_batch(records)
+        self.with_wal_mut(|wal| wal.append_batch(records))
     }
 
     pub fn flush(&self) -> Result<(), WalError> {
-        self.lock().flush()
+        self.with_wal_mut(Wal::flush)
     }
 
     pub fn sync(&self) -> Result<(), WalError> {
-        self.lock().sync()
+        self.with_wal_mut(Wal::sync)
     }
 
     pub fn sync_through(&self, lsn: Lsn) -> Result<(), WalError> {
+        if self.sync_state.durable_lsn() >= lsn {
+            return Ok(());
+        }
+
         let mut wal = self.lock();
 
         if wal.durable_lsn() >= lsn {
+            self.publish_locked_durable_lsn(&wal);
             return Ok(());
         }
 
@@ -113,9 +124,11 @@ where
             return Err(WalError::LsnOutOfRange { lsn });
         }
 
-        wal.sync()?;
+        let result = wal.sync();
+        self.publish_locked_durable_lsn(&wal);
+        result?;
 
-        if wal.durable_lsn() >= lsn {
+        if self.sync_state.durable_lsn() >= lsn {
             Ok(())
         } else {
             Err(WalError::BrokenDurabilityContract)
@@ -123,7 +136,7 @@ where
     }
 
     pub fn shutdown(&self) -> Result<(), WalError> {
-        self.lock().shutdown()
+        self.with_wal_mut(Wal::shutdown)
     }
 
     pub fn read_at(&self, lsn: Lsn) -> Result<WalRecord, WalError> {
@@ -139,11 +152,11 @@ where
     }
 
     pub fn durable_lsn(&self) -> Lsn {
-        self.lock().durable_lsn()
+        self.sync_state.durable_lsn()
     }
 
     pub fn set_min_retention_lsn(&self, lsn: Lsn) -> Result<(), WalError> {
-        self.lock().set_min_retention_lsn(lsn)
+        self.with_wal_mut(|wal| wal.set_min_retention_lsn(lsn))
     }
 
     pub fn acquire_retention_pin(
@@ -155,7 +168,7 @@ where
     }
 
     pub fn truncate_segments_before(&self, lsn: Lsn) -> Result<usize, WalError> {
-        self.lock().truncate_segments_before(lsn)
+        self.with_wal_mut(|wal| wal.truncate_segments_before(lsn))
     }
 
     pub fn metrics(&self) -> WalMetrics {
@@ -181,5 +194,19 @@ where
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn with_wal_mut<T>(
+        &self,
+        operation: impl FnOnce(&mut Wal<D, C>) -> Result<T, WalError>,
+    ) -> Result<T, WalError> {
+        let mut wal = self.lock();
+        let result = operation(&mut wal);
+        self.publish_locked_durable_lsn(&wal);
+        result
+    }
+
+    fn publish_locked_durable_lsn(&self, wal: &Wal<D, C>) {
+        self.sync_state.publish_durable_lsn(wal.durable_lsn());
     }
 }

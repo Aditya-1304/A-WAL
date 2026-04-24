@@ -9,6 +9,7 @@ pub mod retention;
 pub mod retention_pin;
 pub mod segment;
 pub mod shutdown;
+pub mod sync_coordinator;
 
 pub use engine::{ReservationSnapshot, WalReservation};
 pub use handle::WalHandle;
