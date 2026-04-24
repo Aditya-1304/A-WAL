@@ -6,7 +6,7 @@ pub struct SyncCoordinator {
     pub requested_lsn: Option<Lsn>,
     pub sync_in_flight: bool,
     pub waiting_sync_requests: usize,
-    pub last_error: Option<String>,
+    pub last_error: Option<WalError>,
 }
 
 impl SyncCoordinator {
@@ -33,18 +33,35 @@ impl SyncCoordinator {
 
     pub fn add_waiter(&mut self, lsn: Lsn) {
         self.waiting_sync_requests += 1;
-        self.requested_lsn = Some(match self.requested_lsn {
-            Some(existing) => existing.max(lsn),
-            None => lsn,
-        });
+        self.refresh_requested_lsn(lsn);
     }
 
     pub fn remove_waiter(&mut self) {
-        self.waiting_sync_requests = self.waiting_sync_requests.saturating_sub(1);
+        debug_assert!(
+            self.waiting_sync_requests > 0,
+            "sync waiter count underflow"
+        );
+
+        if self.waiting_sync_requests > 0 {
+            self.waiting_sync_requests -= 1;
+        }
 
         if self.waiting_sync_requests == 0 && !self.sync_in_flight {
             self.requested_lsn = None;
         }
+    }
+
+    pub fn finish_waiter<T>(&mut self, result: Result<T, WalError>) -> Result<T, WalError> {
+        self.remove_waiter();
+
+        result
+    }
+
+    pub fn refresh_requested_lsn(&mut self, lsn: Lsn) {
+        self.requested_lsn = Some(match self.requested_lsn {
+            Some(existing) => existing.max(lsn),
+            None => lsn,
+        });
     }
 
     pub fn begin_sync(&mut self) {
@@ -64,12 +81,16 @@ impl SyncCoordinator {
         }
     }
 
-    pub fn finish_sync_error(&mut self, error: &WalError) {
+    pub fn finish_sync_error(&mut self, error: WalError) {
         self.sync_in_flight = false;
-        self.last_error = Some(error.to_string());
+        self.last_error = Some(error);
     }
 
     pub fn finish_sync_without_error(&mut self) {
         self.sync_in_flight = false;
+    }
+
+    pub fn last_error(&self) -> Option<WalError> {
+        self.last_error.clone()
     }
 }

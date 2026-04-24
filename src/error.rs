@@ -74,6 +74,100 @@ pub enum WalError {
     ReservationOverflow,
 }
 
+impl Clone for WalError {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Io(source) => Self::Io(clone_io_error(source)),
+
+            Self::InvalidConfig { reason } => Self::InvalidConfig {
+                reason: reason.clone(),
+            },
+
+            Self::UnsupportedVersion { found, expected } => Self::UnsupportedVersion {
+                found: *found,
+                expected: *expected,
+            },
+
+            Self::BadMagic { found } => Self::BadMagic { found: *found },
+
+            Self::IdentityMismatch { expected, found } => Self::IdentityMismatch {
+                expected: *expected,
+                found: *found,
+            },
+
+            Self::BadSegmentHeader => Self::BadSegmentHeader,
+
+            Self::BadRecordHeader => Self::BadRecordHeader,
+
+            Self::UnsupportedRecordFlags { found } => {
+                Self::UnsupportedRecordFlags { found: *found }
+            }
+
+            Self::PayloadTooLarge { len, max } => Self::PayloadTooLarge {
+                len: *len,
+                max: *max,
+            },
+
+            Self::UnsupportedChecksumAlgorithm { found } => {
+                Self::UnsupportedChecksumAlgorithm { found: *found }
+            }
+
+            Self::UnsupportedCompressionAlgorithm { found } => {
+                Self::UnsupportedCompressionAlgorithm { found: *found }
+            }
+
+            Self::ChecksumMismatch { lsn } => Self::ChecksumMismatch { lsn: *lsn },
+
+            Self::ShortRead => Self::ShortRead,
+
+            Self::DiskFull => Self::DiskFull,
+
+            Self::FatalIo { operation, source } => Self::FatalIo {
+                operation: *operation,
+                source: clone_io_error(source),
+            },
+
+            Self::BrokenDurabilityContract => Self::BrokenDurabilityContract,
+
+            Self::NonMonotonicLsn { expected, found } => Self::NonMonotonicLsn {
+                expected: *expected,
+                found: *found,
+            },
+
+            Self::LsnPruned { lsn } => Self::LsnPruned { lsn: *lsn },
+
+            Self::LsnOutOfRange { lsn } => Self::LsnOutOfRange { lsn: *lsn },
+
+            Self::ReadOnlyViolation => Self::ReadOnlyViolation,
+
+            Self::SegmentOrderingViolation => Self::SegmentOrderingViolation,
+
+            Self::FilenameHeaderMismatch => Self::FilenameHeaderMismatch,
+
+            Self::ReadOnlyTailCorruption => Self::ReadOnlyTailCorruption,
+
+            Self::CorruptionInSealedSegment => Self::CorruptionInSealedSegment,
+
+            Self::WalSizeLimitExceeded { current, limit } => Self::WalSizeLimitExceeded {
+                current: *current,
+                limit: *limit,
+            },
+
+            Self::ShutdownInProgress => Self::ShutdownInProgress,
+
+            Self::DecompressionError { reason } => Self::DecompressionError {
+                reason: reason.clone(),
+            },
+
+            Self::ReservationOverflow => Self::ReservationOverflow,
+        }
+    }
+}
+
+fn clone_io_error(source: &io::Error) -> io::Error {
+    io::Error::new(source.kind(), source.to_string())
+}
+
 impl WalError {
     pub fn invalid_config(reason: impl Into<String>) -> Self {
         Self::InvalidConfig {

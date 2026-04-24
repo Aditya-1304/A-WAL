@@ -163,18 +163,25 @@ where
 
         loop {
             if coordinator.durable_lsn() >= lsn {
-                coordinator.remove_waiter();
-                return Ok(());
+                return coordinator.finish_waiter(Ok(()));
             }
+
+            if let Some(error) = coordinator.last_error() {
+                return coordinator.finish_waiter(Err(error));
+            }
+
+            coordinator.refresh_requested_lsn(lsn);
 
             if coordinator.sync_in_flight {
                 coordinator = condvar
                     .wait(coordinator)
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+
                 continue;
             }
 
             let requested_lsn = coordinator.requested_lsn.unwrap_or(lsn);
+
             coordinator.begin_sync();
 
             drop(coordinator);
@@ -186,19 +193,30 @@ where
             match sync_result {
                 Ok(durable_lsn) => {
                     coordinator.finish_sync_success(durable_lsn);
+
                     condvar.notify_all();
                 }
+
                 Err(WalError::LsnOutOfRange { lsn }) => {
                     coordinator.finish_sync_without_error();
-                    coordinator.remove_waiter();
+
+                    let result = coordinator.finish_waiter(Err(WalError::LsnOutOfRange { lsn }));
+
                     condvar.notify_all();
-                    return Err(WalError::LsnOutOfRange { lsn });
+
+                    return result;
                 }
+
                 Err(error) => {
-                    coordinator.finish_sync_error(&error);
-                    coordinator.remove_waiter();
+                    let result = Err(error.clone());
+
+                    coordinator.finish_sync_error(error);
+
+                    let result = coordinator.finish_waiter(result);
+
                     condvar.notify_all();
-                    return Err(error);
+
+                    return result;
                 }
             }
         }

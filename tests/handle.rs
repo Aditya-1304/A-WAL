@@ -4,7 +4,7 @@ use std::{
     process,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -68,6 +68,8 @@ struct BlockingSyncDirectory {
 
 struct BlockingSyncState {
     block_next_sync: AtomicBool,
+    fail_next_sync: AtomicBool,
+    sync_calls: AtomicU64,
     sync_entered_tx: mpsc::Sender<()>,
     sync_entered_rx: Mutex<mpsc::Receiver<()>>,
     release_tx: mpsc::Sender<()>,
@@ -88,6 +90,8 @@ impl BlockingSyncDirectory {
             inner: FsSegmentDirectory::new(path),
             state: Arc::new(BlockingSyncState {
                 block_next_sync: AtomicBool::new(false),
+                fail_next_sync: AtomicBool::new(false),
+                sync_calls: AtomicU64::new(0),
                 sync_entered_tx,
                 sync_entered_rx: Mutex::new(sync_entered_rx),
                 release_tx,
@@ -96,8 +100,16 @@ impl BlockingSyncDirectory {
         }
     }
 
+    fn sync_calls(&self) -> u64 {
+        self.state.sync_calls.load(Ordering::SeqCst)
+    }
+
     fn block_next_sync(&self) {
         self.state.block_next_sync.store(true, Ordering::SeqCst);
+    }
+
+    fn fail_next_sync(&self) {
+        self.state.fail_next_sync.store(true, Ordering::SeqCst);
     }
 
     fn wait_until_sync_blocked(&self) {
@@ -135,9 +147,15 @@ impl SegmentFile for BlockingSyncFile {
     }
 
     fn sync(&mut self) -> io::Result<()> {
+        self.state.sync_calls.fetch_add(1, Ordering::SeqCst);
+
         if self.state.block_next_sync.swap(false, Ordering::SeqCst) {
             let _ = self.state.sync_entered_tx.send(());
             let _ = self.state.release_rx.lock().unwrap().recv();
+        }
+
+        if self.state.fail_next_sync.swap(false, Ordering::SeqCst) {
+            return Err(io::Error::other("injected sync failure"));
         }
 
         self.inner.sync()
@@ -194,6 +212,158 @@ impl SegmentDirectory for BlockingSyncDirectory {
     fn sync_directory(&self) -> io::Result<()> {
         self.inner.sync_directory()
     }
+}
+
+#[derive(Clone)]
+struct BlockingReadDirectory {
+    inner: FsSegmentDirectory,
+    state: Arc<BlockingReadState>,
+}
+
+struct BlockingReadState {
+    block_next_read: AtomicBool,
+    read_entered_tx: mpsc::Sender<()>,
+    read_entered_rx: Mutex<mpsc::Receiver<()>>,
+    release_tx: mpsc::Sender<()>,
+    release_rx: Mutex<mpsc::Receiver<()>>,
+}
+
+struct BlockingReadFile {
+    inner: FsSegmentFile,
+    state: Arc<BlockingReadState>,
+}
+
+impl BlockingReadDirectory {
+    fn new(path: PathBuf) -> Self {
+        let (read_entered_tx, read_entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        Self {
+            inner: FsSegmentDirectory::new(path),
+            state: Arc::new(BlockingReadState {
+                block_next_read: AtomicBool::new(false),
+                read_entered_tx,
+                read_entered_rx: Mutex::new(read_entered_rx),
+                release_tx,
+                release_rx: Mutex::new(release_rx),
+            }),
+        }
+    }
+
+    fn block_next_read(&self) {
+        self.state.block_next_read.store(true, Ordering::SeqCst);
+    }
+
+    fn wait_until_read_blocked(&self) {
+        self.state
+            .read_entered_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .expect("read did not reach the blocking point");
+    }
+
+    fn release_blocked_read(&self) {
+        self.state
+            .release_tx
+            .send(())
+            .expect("blocked read receiver was dropped");
+    }
+}
+
+impl SegmentFile for BlockingReadFile {
+    fn len(&self) -> io::Result<u64> {
+        self.inner.len()
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        if self.state.block_next_read.swap(false, Ordering::SeqCst) {
+            let _ = self.state.read_entered_tx.send(());
+            let _ = self.state.release_rx.lock().unwrap().recv();
+        }
+
+        self.inner.read_at(offset, buf)
+    }
+
+    fn append_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.inner.append_all(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+
+    fn sync(&mut self) -> io::Result<()> {
+        self.inner.sync()
+    }
+
+    fn truncate(&mut self, len: u64) -> io::Result<()> {
+        self.inner.truncate(len)
+    }
+
+    fn advise_sequential(&self) -> io::Result<()> {
+        self.inner.advise_sequential()
+    }
+
+    fn prefetch(&self, offset: u64, len: u64) -> io::Result<()> {
+        self.inner.prefetch(offset, len)
+    }
+}
+
+impl SegmentDirectory for BlockingReadDirectory {
+    type File = BlockingReadFile;
+
+    fn list_segments(&self) -> io::Result<Vec<SegmentMeta>> {
+        self.inner.list_segments()
+    }
+
+    fn create_segment(&self, spec: NewSegment) -> io::Result<Self::File> {
+        let inner = self.inner.create_segment(spec)?;
+
+        Ok(BlockingReadFile {
+            inner,
+            state: Arc::clone(&self.state),
+        })
+    }
+
+    fn open_segment(&self, id: SegmentId) -> io::Result<Self::File> {
+        let inner = self.inner.open_segment(id)?;
+
+        Ok(BlockingReadFile {
+            inner,
+            state: Arc::clone(&self.state),
+        })
+    }
+
+    fn remove_segment(&self, id: SegmentId) -> io::Result<()> {
+        self.inner.remove_segment(id)
+    }
+
+    fn recycle_sgement(&self, old_id: SegmentId, new_spec: NewSegment) -> io::Result<Self::File> {
+        let inner = self.inner.recycle_sgement(old_id, new_spec)?;
+
+        Ok(BlockingReadFile {
+            inner,
+            state: Arc::clone(&self.state),
+        })
+    }
+
+    fn sync_directory(&self) -> io::Result<()> {
+        self.inner.sync_directory()
+    }
+}
+
+fn assert_sync_fatal_error(error: WalError) {
+    assert!(
+        matches!(
+            error,
+            WalError::FatalIo {
+                operation: "sync wal segment",
+                ..
+            }
+        ),
+        "expected sync fatal error, got {error:?}"
+    );
 }
 
 #[test]
@@ -459,6 +629,54 @@ fn tail_from_reads_existing_and_future_records() {
 }
 
 #[test]
+fn tail_next_blocking_wakes_after_concurrent_append() {
+    let test_dir = TestDir::new("tail-concurrent-wakeup");
+
+    let (handle, _) = WalHandle::open(
+        FsSegmentDirectory::new(test_dir.path().to_path_buf()),
+        test_dir.config(),
+        (),
+    )
+    .unwrap();
+
+    let mut tail = handle.tail_from(Lsn::ZERO).unwrap();
+
+    let (tail_done_tx, tail_done_rx) = mpsc::channel();
+
+    let tail_join = thread::spawn(move || {
+        let result = tail.next_blocking(Duration::from_secs(2));
+
+        tail_done_tx.send(()).unwrap();
+
+        result
+    });
+
+    assert!(
+        tail_done_rx
+            .recv_timeout(Duration::from_millis(25))
+            .is_err(),
+        "tail returned before a concurrent append"
+    );
+
+    let append_join = {
+        let handle = handle.clone();
+
+        thread::spawn(move || {
+            handle
+                .append(RecordType::new(record_types::USER_MIN), b"wake me")
+                .unwrap()
+        })
+    };
+
+    let appended_lsn = append_join.join().unwrap();
+
+    let record = tail_join.join().unwrap().unwrap().unwrap();
+
+    assert_eq!(record.lsn, appended_lsn);
+    assert_eq!(record.payload, b"wake me");
+}
+
+#[test]
 fn tail_from_timeout_returns_none_at_live_tip() {
     let test_dir = TestDir::new("tail-timeout");
     let (handle, _) = WalHandle::open(
@@ -475,4 +693,250 @@ fn tail_from_timeout_returns_none_at_live_tip() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn group_commit_wakes_all_waiters_covered_by_one_sync() {
+    let test_dir = TestDir::new("group-commit");
+    let directory = BlockingSyncDirectory::new(test_dir.path().to_path_buf());
+
+    let (handle, _) = WalHandle::open(directory.clone(), test_dir.config(), ()).unwrap();
+
+    let records = [
+        (RecordType::new(record_types::USER_MIN), &b"alpha"[..]),
+        (RecordType::new(record_types::USER_MIN + 1), &b"beta"[..]),
+        (RecordType::new(record_types::USER_MIN + 2), &b"gamma"[..]),
+    ];
+
+    handle.append_batch(&records).unwrap();
+
+    let first_end = Lsn::new((RECORD_HEADER_LEN + b"alpha".len()) as u64);
+
+    let second_end =
+        Lsn::new((RECORD_HEADER_LEN + b"alpha".len() + RECORD_HEADER_LEN + b"beta".len()) as u64);
+
+    let final_end = Lsn::new(
+        (RECORD_HEADER_LEN
+            + b"alpha".len()
+            + RECORD_HEADER_LEN
+            + b"beta".len()
+            + RECORD_HEADER_LEN
+            + b"gamma".len()) as u64,
+    );
+
+    let sync_calls_before = directory.sync_calls();
+
+    directory.block_next_sync();
+
+    let leader = {
+        let handle = handle.clone();
+
+        thread::spawn(move || handle.sync_through(final_end))
+    };
+
+    directory.wait_until_sync_blocked();
+
+    let targets = [first_end, second_end, final_end, final_end];
+
+    let waiter_count = targets.len();
+
+    let (started_tx, started_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+
+    let waiters = targets
+        .into_iter()
+        .map(|target| {
+            let handle = handle.clone();
+            let started_tx = started_tx.clone();
+            let done_tx = done_tx.clone();
+
+            thread::spawn(move || {
+                started_tx.send(target).unwrap();
+
+                let result = handle.sync_through(target);
+
+                done_tx.send(target).unwrap();
+
+                result
+            })
+        })
+        .collect::<Vec<_>>();
+
+    drop(started_tx);
+    drop(done_tx);
+
+    for _ in 0..waiter_count {
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("sync waiter did not start");
+    }
+
+    assert!(
+        done_rx.recv_timeout(Duration::from_millis(25)).is_err(),
+        "waiter completed before the blocked sync was released"
+    );
+
+    directory.release_blocked_sync();
+
+    leader.join().unwrap().unwrap();
+
+    for waiter in waiters {
+        waiter.join().unwrap().unwrap();
+    }
+
+    assert_eq!(directory.sync_calls() - sync_calls_before, 1);
+    assert_eq!(handle.durable_lsn(), final_end);
+}
+
+#[test]
+fn failed_group_commit_wakes_all_waiters_without_retrying_sync() {
+    let test_dir = TestDir::new("group-commit-failure");
+    let directory = BlockingSyncDirectory::new(test_dir.path().to_path_buf());
+
+    let (handle, _) = WalHandle::open(directory.clone(), test_dir.config(), ()).unwrap();
+
+    let records = [
+        (RecordType::new(record_types::USER_MIN), &b"alpha"[..]),
+        (RecordType::new(record_types::USER_MIN + 1), &b"beta"[..]),
+        (RecordType::new(record_types::USER_MIN + 2), &b"gamma"[..]),
+    ];
+
+    handle.append_batch(&records).unwrap();
+
+    let first_end = Lsn::new((RECORD_HEADER_LEN + b"alpha".len()) as u64);
+
+    let second_end =
+        Lsn::new((RECORD_HEADER_LEN + b"alpha".len() + RECORD_HEADER_LEN + b"beta".len()) as u64);
+
+    let final_end = Lsn::new(
+        (RECORD_HEADER_LEN
+            + b"alpha".len()
+            + RECORD_HEADER_LEN
+            + b"beta".len()
+            + RECORD_HEADER_LEN
+            + b"gamma".len()) as u64,
+    );
+
+    let sync_calls_before = directory.sync_calls();
+
+    directory.block_next_sync();
+    directory.fail_next_sync();
+
+    let leader = {
+        let handle = handle.clone();
+
+        thread::spawn(move || handle.sync_through(final_end))
+    };
+
+    directory.wait_until_sync_blocked();
+
+    let targets = [first_end, second_end, final_end, final_end];
+
+    let waiter_count = targets.len();
+
+    let (started_tx, started_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+
+    let waiters = targets
+        .into_iter()
+        .map(|target| {
+            let handle = handle.clone();
+            let started_tx = started_tx.clone();
+            let done_tx = done_tx.clone();
+
+            thread::spawn(move || {
+                started_tx.send(target).unwrap();
+
+                let result = handle.sync_through(target);
+
+                done_tx.send(target).unwrap();
+
+                result
+            })
+        })
+        .collect::<Vec<_>>();
+
+    drop(started_tx);
+    drop(done_tx);
+
+    for _ in 0..waiter_count {
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("sync waiter did not start");
+    }
+
+    assert!(
+        done_rx.recv_timeout(Duration::from_millis(25)).is_err(),
+        "waiter completed before the blocked sync failed"
+    );
+
+    directory.release_blocked_sync();
+
+    let leader_error = leader.join().unwrap().unwrap_err();
+
+    assert_sync_fatal_error(leader_error);
+
+    for waiter in waiters {
+        let waiter_error = waiter.join().unwrap().unwrap_err();
+
+        assert_sync_fatal_error(waiter_error);
+    }
+
+    assert_eq!(directory.sync_calls() - sync_calls_before, 1);
+    assert_eq!(handle.durable_lsn(), Lsn::ZERO);
+}
+
+#[test]
+fn read_at_does_not_hold_wal_mutex_during_file_io() {
+    let test_dir = TestDir::new("read-at-nonblocking");
+    let directory = BlockingReadDirectory::new(test_dir.path().to_path_buf());
+
+    let (handle, _) = WalHandle::open(directory.clone(), test_dir.config(), ()).unwrap();
+
+    let first_lsn = handle
+        .append(RecordType::new(record_types::USER_MIN), b"first")
+        .unwrap();
+
+    handle.sync().unwrap();
+
+    directory.block_next_read();
+
+    let read_join = {
+        let handle = handle.clone();
+
+        thread::spawn(move || handle.read_at(first_lsn))
+    };
+
+    directory.wait_until_read_blocked();
+
+    let (append_done_tx, append_done_rx) = mpsc::channel();
+
+    let append_join = {
+        let handle = handle.clone();
+
+        thread::spawn(move || {
+            let appended_lsn = handle
+                .append(RecordType::new(record_types::USER_MIN + 1), b"second")
+                .unwrap();
+
+            append_done_tx.send(appended_lsn).unwrap();
+
+            appended_lsn
+        })
+    };
+
+    let appended_lsn = append_done_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("append blocked behind read file I/O");
+
+    assert!(appended_lsn > first_lsn);
+
+    directory.release_blocked_read();
+
+    let read_record = read_join.join().unwrap().unwrap();
+
+    assert_eq!(read_record.lsn, first_lsn);
+    assert_eq!(read_record.payload, b"first");
+
+    assert_eq!(append_join.join().unwrap(), appended_lsn);
 }
