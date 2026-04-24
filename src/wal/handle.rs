@@ -90,6 +90,10 @@ where
         self.lock().append(record_type, payload)
     }
 
+    pub fn append_batch(&self, records: &[(RecordType, &[u8])]) -> Result<Vec<Lsn>, WalError> {
+        self.lock().append_batch(records)
+    }
+
     pub fn flush(&self) -> Result<(), WalError> {
         self.lock().flush()
     }

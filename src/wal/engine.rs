@@ -317,6 +317,106 @@ where
         Ok(lsn)
     }
 
+    pub fn append_batch(&mut self, records: &[(RecordType, &[u8])]) -> Result<Vec<Lsn>, WalError> {
+        struct PreparedBatchRecord {
+            record_type: RecordType,
+            original_payload_len: u64,
+            on_disk_payload: Vec<u8>,
+            flags: u16,
+            record_bytes: u64,
+        }
+
+        self.ensure_operational()?;
+
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut prepared = Vec::with_capacity(records.len());
+        let mut record_lens = Vec::with_capacity(records.len());
+
+        for &(record_type, payload) in records {
+            if payload.len() > self.config.max_record_size as usize {
+                return Err(WalError::PayloadTooLarge {
+                    len: payload.len() as u32,
+                    max: self.config.max_record_size,
+                });
+            }
+
+            let original_payload_len = payload.len() as u64;
+            let (on_disk_payload, flags) = self.prepare_payload_for_append(payload)?;
+            let record_bytes =
+                self.record_physical_len_for_payload_len(on_disk_payload.len())? as u64;
+
+            prepared.push(PreparedBatchRecord {
+                record_type,
+                original_payload_len,
+                on_disk_payload,
+                flags,
+                record_bytes,
+            });
+            record_lens.push(record_bytes);
+        }
+
+        self.preflight_batch_append(&record_lens, true)?;
+
+        let mut lsns = Vec::with_capacity(prepared.len());
+        let mut appended_records = 0u64;
+        let mut appended_bytes = 0u64;
+
+        for record in prepared {
+            let lsn = match self.stage_record(
+                record.record_type,
+                record.flags,
+                &record.on_disk_payload,
+                true,
+            ) {
+                Ok(lsn) => lsn,
+                Err(err) => {
+                    if appended_records > 0 {
+                        self.metrics
+                            .note_appended_records(appended_records, appended_bytes);
+                    }
+                    return Err(err);
+                }
+            };
+
+            self.active_segment_record_count = self
+                .active_segment_record_count
+                .checked_add(1)
+                .ok_or(WalError::ReservationOverflow)?;
+
+            if self.first_lsn.is_none() {
+                self.first_lsn = Some(lsn);
+            }
+
+            appended_records = appended_records
+                .checked_add(1)
+                .ok_or(WalError::ReservationOverflow)?;
+            appended_bytes = appended_bytes
+                .checked_add(record.record_bytes)
+                .ok_or(WalError::ReservationOverflow)?;
+
+            if record.flags & record_flags::COMPRESSED != 0 {
+                self.metrics.note_compression(
+                    record.original_payload_len,
+                    record.on_disk_payload.len() as u64,
+                );
+            }
+
+            lsns.push(lsn);
+        }
+
+        self.metrics
+            .note_batch_append(appended_records, appended_bytes);
+
+        if matches!(self.config.sync_policy, SyncPolicy::Always) {
+            self.sync()?;
+        }
+
+        Ok(lsns)
+    }
+
     pub fn flush(&mut self) -> Result<(), WalError> {
         self.ensure_operational()?;
         self.flush_inner()
@@ -499,6 +599,105 @@ where
 
         let projected_growth =
             self.predicted_record_admission_growth(record_len, reserve_future_seal_space)?;
+        let projected_size = current_admitted_size
+            .checked_add(projected_growth)
+            .ok_or(WalError::ReservationOverflow)?;
+
+        if projected_size > limit {
+            return Err(WalError::WalSizeLimitExceeded {
+                current: projected_size,
+                limit,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn preflight_batch_append(
+        &self,
+        record_lens: &[u64],
+        reserve_future_seal_space: bool,
+    ) -> Result<(), WalError> {
+        if record_lens.is_empty() {
+            return Ok(());
+        }
+
+        let buffered_len = self.write_buffer.len() as u64;
+        let mut projected_growth = 0u64;
+        let mut simulated_segment_used = match self.active_segment.as_ref() {
+            Some(segment) => Some(
+                segment
+                    .file_len()
+                    .checked_add(buffered_len)
+                    .ok_or(WalError::ReservationOverflow)?,
+            ),
+            None => None,
+        };
+        let mut simulated_segment_is_empty = self.active_segment_is_empty();
+
+        for &record_len in record_lens {
+            if simulated_segment_used.is_none() {
+                projected_growth = projected_growth
+                    .checked_add(SEGMENT_HEADER_LEN)
+                    .ok_or(WalError::ReservationOverflow)?;
+                simulated_segment_used = Some(SEGMENT_HEADER_LEN);
+                simulated_segment_is_empty = true;
+            }
+
+            let mut segment_used =
+                simulated_segment_used.ok_or(WalError::BrokenDurabilityContract)?;
+
+            if reserve_future_seal_space
+                && !self.projected_segment_can_fit(segment_used, record_len, true)?
+            {
+                if simulated_segment_is_empty {
+                    return Err(WalError::invalid_config(
+                        "target_segment_size must leave room for one maximum sized record plus a trailing SEGMENT_SEAL record",
+                    ));
+                }
+
+                projected_growth = projected_growth
+                    .checked_add(self.seal_record_physical_len()? as u64)
+                    .and_then(|value| value.checked_add(SEGMENT_HEADER_LEN))
+                    .ok_or(WalError::ReservationOverflow)?;
+                segment_used = SEGMENT_HEADER_LEN;
+                simulated_segment_is_empty = true;
+            }
+
+            if !self.projected_segment_can_fit(
+                segment_used,
+                record_len,
+                reserve_future_seal_space,
+            )? {
+                if reserve_future_seal_space && simulated_segment_is_empty {
+                    return Err(WalError::invalid_config(
+                        "target_segment_size must leave room for one maximum sized record plus a trailing SEGMENT_SEAL record",
+                    ));
+                }
+
+                return Err(WalError::invalid_config(
+                    "active segment cannot fit staged record",
+                ));
+            }
+
+            projected_growth = projected_growth
+                .checked_add(record_len)
+                .ok_or(WalError::ReservationOverflow)?;
+            segment_used = segment_used
+                .checked_add(record_len)
+                .ok_or(WalError::ReservationOverflow)?;
+            simulated_segment_used = Some(segment_used);
+            simulated_segment_is_empty = false;
+        }
+
+        let Some(limit) = self.config.max_wal_size else {
+            return Ok(());
+        };
+
+        let current_admitted_size = self
+            .current_wal_size
+            .checked_add(buffered_len)
+            .ok_or(WalError::ReservationOverflow)?;
         let projected_size = current_admitted_size
             .checked_add(projected_growth)
             .ok_or(WalError::ReservationOverflow)?;
@@ -784,6 +983,20 @@ where
             .as_ref()
             .ok_or(WalError::BrokenDurabilityContract)?;
 
+        let segment_used = active_segment
+            .file_len()
+            .checked_add(self.write_buffer.len() as u64)
+            .ok_or(WalError::ReservationOverflow)?;
+
+        self.projected_segment_can_fit(segment_used, additional_bytes, reserve_future_seal_space)
+    }
+
+    fn projected_segment_can_fit(
+        &self,
+        segment_used: u64,
+        additional_bytes: u64,
+        reserve_future_seal_space: bool,
+    ) -> Result<bool, WalError> {
         let mut required = additional_bytes;
         if reserve_future_seal_space {
             required = required
@@ -791,13 +1004,7 @@ where
                 .ok_or(WalError::ReservationOverflow)?;
         }
 
-        let buffered_len = self.write_buffer.len() as u64;
-        let used = active_segment
-            .file_len()
-            .checked_add(buffered_len)
-            .ok_or(WalError::ReservationOverflow)?;
-
-        let final_len = used
+        let final_len = segment_used
             .checked_add(required)
             .ok_or(WalError::ReservationOverflow)?;
 

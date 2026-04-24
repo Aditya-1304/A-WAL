@@ -38,10 +38,14 @@ impl WalMetrics {
         self.bytes_appended = self.bytes_appended.saturating_add(bytes);
     }
 
-    pub fn note_batch_append(&mut self, records: u64, bytes: u64) {
-        self.batch_appends = self.batch_appends.saturating_add(1);
+    pub fn note_appended_records(&mut self, records: u64, bytes: u64) {
         self.records_appended = self.records_appended.saturating_add(records);
         self.bytes_appended = self.bytes_appended.saturating_add(bytes);
+    }
+
+    pub fn note_batch_append(&mut self, records: u64, bytes: u64) {
+        self.batch_appends = self.batch_appends.saturating_add(1);
+        self.note_appended_records(records, bytes);
     }
 
     pub fn note_sync(&mut self, bytes_synced: u64, duration: Duration) {
