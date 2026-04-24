@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use crate::{
     error::WalError,
     format::segment_header::SegmentHeader,
@@ -78,9 +80,14 @@ pub fn plan_truncate_segments_before<D: SegmentDirectory>(
     let mut first_remaining_lsn = None;
     let mut previous_end_lsn = None;
     let mut prefix_is_still_removable = true;
+    let mut seen_segment_ids = BTreeSet::new();
 
     for meta in metas {
-        let file = directory.open_segment(meta.segment_id)?;
+        if !seen_segment_ids.insert(meta.segment_id) {
+            return Err(WalError::SegmentOrderingViolation);
+        }
+
+        let file = directory.open_segment_meta(&meta)?;
         let file_len = file.len()?;
         let header = read_segment_header(&file)?;
 
@@ -138,15 +145,7 @@ pub fn execute_truncate_plan<D: SegmentDirectory>(
     directory: &D,
     plan: &TruncatePlan,
 ) -> Result<usize, WalError> {
-    let mut removed = 0usize;
-
-    for &segment_id in &plan.removable_segment_ids {
-        directory.remove_segment(segment_id)?;
-        directory.sync_directory()?;
-        removed += 1;
-    }
-
-    Ok(removed)
+    Ok(directory.remove_segments(&plan.removable_segment_ids)?)
 }
 
 fn read_segment_header<F: SegmentFile>(file: &F) -> Result<SegmentHeader, WalError> {

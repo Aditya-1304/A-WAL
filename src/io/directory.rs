@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     fs::{self, File, OpenOptions},
     io,
@@ -36,6 +37,19 @@ pub trait SegmentDirectory {
     fn create_segment(&self, spec: NewSegment) -> io::Result<Self::File>;
     fn open_segment(&self, id: SegmentId) -> io::Result<Self::File>;
     fn remove_segment(&self, ig: SegmentId) -> io::Result<()>;
+
+    fn open_segment_meta(&self, meta: &SegmentMeta) -> io::Result<Self::File> {
+        self.open_segment(meta.segment_id)
+    }
+
+    fn remove_segments(&self, ids: &[SegmentId]) -> io::Result<usize> {
+        for &id in ids {
+            self.remove_segment(id)?;
+        }
+
+        Ok(ids.len())
+    }
+
     fn recycle_sgement(&self, old_id: SegmentId, new_spec: NewSegment) -> io::Result<Self::File>;
     fn sync_directory(&self) -> io::Result<()>;
 }
@@ -184,6 +198,15 @@ impl SegmentDirectory for FsSegmentDirectory {
         Ok(FsSegmentFile::from_file(file))
     }
 
+    fn open_segment_meta(&self, meta: &SegmentMeta) -> io::Result<Self::File> {
+        let file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&meta.path)?;
+
+        Ok(FsSegmentFile::from_file(file))
+    }
+
     fn remove_segment(&self, ig: SegmentId) -> io::Result<()> {
         let mut matches = self
             .list_segments()?
@@ -207,6 +230,51 @@ impl SegmentDirectory for FsSegmentDirectory {
         fs::remove_file(&meta.path)?;
         self.sync_directory()?;
         Ok(())
+    }
+
+    fn remove_segments(&self, ids: &[SegmentId]) -> io::Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut requested = BTreeSet::new();
+        for &id in ids {
+            if !requested.insert(id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("duplicate segment id {id} in remove request"),
+                ));
+            }
+        }
+
+        let mut segments_by_id = BTreeMap::new();
+        for meta in self.list_segments()? {
+            if segments_by_id.insert(meta.segment_id, meta.path).is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("multiple segments found for segment id {}", meta.segment_id),
+                ));
+            }
+        }
+
+        let mut paths = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let path = segments_by_id.get(&id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("segment {id} was not found"),
+                )
+            })?;
+
+            paths.push(path.clone());
+        }
+
+        for path in paths {
+            fs::remove_file(path)?;
+        }
+
+        self.sync_directory()?;
+        Ok(ids.len())
     }
 
     fn recycle_sgement(&self, old_id: SegmentId, new_spec: NewSegment) -> io::Result<Self::File> {
@@ -310,7 +378,7 @@ fn wal_error_to_invalid_data(err: WalError) -> io::Error {
 mod tests {
     use super::*;
     use crate::{
-        format::segment_header::{SegmentHeader, compression_algorithms},
+        format::segment_header::{compression_algorithms, SegmentHeader},
         io::segment_file::SegmentFile,
         types::WalIdentity,
     };
@@ -500,5 +568,42 @@ mod tests {
 
         assert!(!canonical_path.exists());
         assert!(directory.list_segments().unwrap().is_empty());
+    }
+
+    #[test]
+    fn remove_segments_unlinks_multiple_files_with_one_call() {
+        let test_dir = TestDir::new("remove-many");
+        let directory = FsSegmentDirectory::new(test_dir.path().to_path_buf());
+
+        directory
+            .create_segment(sample_new_segment(1, Lsn::new(0)))
+            .unwrap();
+        directory
+            .create_segment(sample_new_segment(2, Lsn::new(100)))
+            .unwrap();
+        directory
+            .create_segment(sample_new_segment(3, Lsn::new(200)))
+            .unwrap();
+
+        let first_path = test_dir
+            .path()
+            .join(format_segment_filename(1, Lsn::new(0)));
+        let second_path = test_dir
+            .path()
+            .join(format_segment_filename(2, Lsn::new(100)));
+        let third_path = test_dir
+            .path()
+            .join(format_segment_filename(3, Lsn::new(200)));
+
+        let removed = directory.remove_segments(&[1, 2]).unwrap();
+
+        assert_eq!(removed, 2);
+        assert!(!first_path.exists());
+        assert!(!second_path.exists());
+        assert!(third_path.exists());
+
+        let metas = directory.list_segments().unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].segment_id, 3);
     }
 }
