@@ -1,5 +1,7 @@
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
+use crate::wal::iterator::{BufferedSegmentFile, snapshot_segments_with_buffer};
 use crate::{
     config::WalConfig,
     error::WalError,
@@ -26,6 +28,7 @@ where
 {
     inner: Arc<Mutex<Wal<D, C>>>,
     sync_state: Arc<SyncCoordinator>,
+    tail_state: Arc<(Mutex<TailCoordinator>, Condvar)>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +39,40 @@ struct ReadSnapshotPlan<D> {
     cap_lsn: Option<Lsn>,
 }
 
+#[derive(Debug, Default)]
+struct TailCoordinator {
+    generation: u64,
+}
+
+pub struct WalTailIterator<D, C>
+where
+    D: SegmentDirectory,
+{
+    handle: WalHandle<D, C>,
+    current_lsn: Lsn,
+    observed_generation: u64,
+    _pin: RetentionPinGuard,
+}
+
+#[derive(Debug, Clone)]
+struct TailSnapshotPlan<D> {
+    directory: D,
+    identity: WalIdentity,
+    record_alignment: u32,
+    active_buffer: Option<(u64, u64, Vec<u8>)>,
+}
+
+impl<D> TailSnapshotPlan<D>
+where
+    D: SegmentDirectory,
+{
+    fn load_segments(
+        &self,
+    ) -> Result<Vec<SnapshotSegment<BufferedSegmentFile<D::File>>>, WalError> {
+        snapshot_segments_with_buffer(&self.directory, self.identity, self.active_buffer.clone())
+    }
+}
+
 impl<D, C> Clone for WalHandle<D, C>
 where
     D: SegmentDirectory,
@@ -44,6 +81,7 @@ where
         Self {
             inner: Arc::clone(&self.inner),
             sync_state: Arc::clone(&self.sync_state),
+            tail_state: Arc::clone(&self.tail_state),
         }
     }
 }
@@ -70,6 +108,7 @@ where
         Self {
             inner: Arc::new(Mutex::new(wal)),
             sync_state: Arc::new(SyncCoordinator::new(durable_lsn)),
+            tail_state: Arc::new((Mutex::new(TailCoordinator::default()), Condvar::new())),
         }
     }
 
@@ -126,6 +165,8 @@ where
 
         let result = wal.sync();
         self.publish_locked_durable_lsn(&wal);
+        drop(wal);
+        self.notify_tailers();
         result?;
 
         if self.sync_state.durable_lsn() >= lsn {
@@ -149,6 +190,21 @@ where
         let snapshot = self.read_snapshot_plan();
         let segments = snapshot.load_segments()?;
         WalIterator::new(segments, snapshot.record_alignment, from)
+    }
+
+    pub fn tail_from(&self, from: Lsn) -> Result<WalTailIterator<D, C>, WalError> {
+        let pin = self.acquire_retention_pin("tail", from)?;
+        let observed_generation = self.tail_generation();
+
+        let tail = WalTailIterator {
+            handle: self.clone(),
+            current_lsn: from,
+            observed_generation,
+            _pin: pin,
+        };
+
+        tail.validate_start()?;
+        Ok(tail)
     }
 
     pub fn durable_lsn(&self) -> Lsn {
@@ -203,10 +259,104 @@ where
         let mut wal = self.lock();
         let result = operation(&mut wal);
         self.publish_locked_durable_lsn(&wal);
+        drop(wal);
+        self.notify_tailers();
         result
     }
 
     fn publish_locked_durable_lsn(&self, wal: &Wal<D, C>) {
         self.sync_state.publish_durable_lsn(wal.durable_lsn());
+    }
+
+    fn tail_snapshot_plan(&self) -> Result<TailSnapshotPlan<D>, WalError> {
+        let wal = self.lock();
+        wal.ensure_tail_available()?;
+
+        Ok(TailSnapshotPlan {
+            directory: wal.cloned_directory(),
+            identity: wal.identity(),
+            record_alignment: wal.record_alignment(),
+            active_buffer: wal.active_buffer_snapshot(),
+        })
+    }
+
+    fn tail_generation(&self) -> u64 {
+        let (lock, _) = &*self.tail_state;
+        lock.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .generation
+    }
+
+    fn notify_tailers(&self) {
+        let (lock, condvar) = &*self.tail_state;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.generation = state.generation.saturating_add(1);
+        condvar.notify_all();
+    }
+}
+
+impl<D, C> WalTailIterator<D, C>
+where
+    D: SegmentDirectory + Clone,
+{
+    pub fn next_nonblocking(&mut self) -> Result<Option<WalRecord>, WalError> {
+        let snapshot = self.handle.tail_snapshot_plan()?;
+        let segments = snapshot.load_segments()?;
+        let mut iter = WalIterator::new(segments, snapshot.record_alignment, self.current_lsn)?;
+
+        match iter.next()? {
+            Some(record) => {
+                self.current_lsn = iter.current_lsn();
+                Ok(Some(record))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn next_blocking(&mut self, timeout: Duration) -> Result<Option<WalRecord>, WalError> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(WalError::ReservationOverflow)?;
+
+        loop {
+            if let Some(record) = self.next_nonblocking()? {
+                return Ok(Some(record));
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+
+            let remaining = deadline.duration_since(now);
+            let (lock, condvar) = &*self.handle.tail_state;
+            let state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            if state.generation != self.observed_generation {
+                self.observed_generation = state.generation;
+                continue;
+            }
+
+            let (state, wait_result) = condvar
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            self.observed_generation = state.generation;
+
+            if wait_result.timed_out() {
+                return Ok(None);
+            }
+        }
+    }
+
+    pub fn current_lsn(&self) -> Lsn {
+        self.current_lsn
+    }
+
+    fn validate_start(&self) -> Result<(), WalError> {
+        let snapshot = self.handle.tail_snapshot_plan()?;
+        let segments = snapshot.load_segments()?;
+        let _ = WalIterator::new(segments, snapshot.record_alignment, self.current_lsn)?;
+        Ok(())
     }
 }

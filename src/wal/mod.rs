@@ -12,4 +12,4 @@ pub mod shutdown;
 pub mod sync_coordinator;
 
 pub use engine::{ReservationSnapshot, WalReservation};
-pub use handle::WalHandle;
+pub use handle::{WalHandle, WalTailIterator};

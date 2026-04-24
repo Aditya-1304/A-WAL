@@ -652,6 +652,24 @@ where
         self.fatal_state.map(|state| state.safe_lsn)
     }
 
+    pub(crate) fn ensure_tail_available(&self) -> Result<(), WalError> {
+        self.ensure_not_fatal()
+    }
+
+    pub(crate) fn active_buffer_snapshot(&self) -> Option<(SegmentId, u64, Vec<u8>)> {
+        let active_segment = self.active_segment.as_ref()?;
+
+        if self.write_buffer.is_empty() {
+            return None;
+        }
+
+        Some((
+            active_segment.segment_id(),
+            active_segment.file_len(),
+            self.write_buffer.as_slice().to_vec(),
+        ))
+    }
+
     fn capture_reservation_snapshot(&self) -> Result<ReservationSnapshot, WalError> {
         let segment_count = self.directory.list_segments()?.len();
 

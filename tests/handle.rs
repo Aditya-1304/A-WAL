@@ -427,3 +427,52 @@ fn sync_through_makes_committed_reservation_durable() {
     assert_eq!(handle.read_at(Lsn::ZERO).unwrap().payload, b"ab");
     assert_eq!(handle.read_at(Lsn::new(34)).unwrap().payload, b"cdef");
 }
+
+#[test]
+fn tail_from_reads_existing_and_future_records() {
+    let test_dir = TestDir::new("tail-existing-future");
+    let (handle, _) = WalHandle::open(
+        FsSegmentDirectory::new(test_dir.path().to_path_buf()),
+        test_dir.config(),
+        (),
+    )
+    .unwrap();
+
+    let first = handle
+        .append(RecordType::new(record_types::USER_MIN), b"first")
+        .unwrap();
+
+    let mut tail = handle.tail_from(first).unwrap();
+
+    let first_seen = tail.next_nonblocking().unwrap().unwrap();
+    assert_eq!(first_seen.payload, b"first");
+
+    assert!(tail.next_nonblocking().unwrap().is_none());
+
+    handle
+        .append(RecordType::new(record_types::USER_MIN + 1), b"second")
+        .unwrap();
+
+    let second_seen = tail.next_blocking(Duration::from_secs(1)).unwrap().unwrap();
+
+    assert_eq!(second_seen.payload, b"second");
+}
+
+#[test]
+fn tail_from_timeout_returns_none_at_live_tip() {
+    let test_dir = TestDir::new("tail-timeout");
+    let (handle, _) = WalHandle::open(
+        FsSegmentDirectory::new(test_dir.path().to_path_buf()),
+        test_dir.config(),
+        (),
+    )
+    .unwrap();
+
+    let mut tail = handle.tail_from(Lsn::ZERO).unwrap();
+
+    assert!(
+        tail.next_blocking(Duration::from_millis(10))
+            .unwrap()
+            .is_none()
+    );
+}

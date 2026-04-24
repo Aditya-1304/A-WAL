@@ -26,6 +26,23 @@ pub struct WalIterator<F> {
 }
 
 #[derive(Debug)]
+pub(crate) struct BufferedSegmentFile<F> {
+    file: F,
+    base_len: u64,
+    buffered_tail: Vec<u8>,
+}
+
+impl<F> BufferedSegmentFile<F> {
+    fn new(file: F, base_len: u64, buffered_tail: Vec<u8>) -> Self {
+        Self {
+            file,
+            base_len,
+            buffered_tail,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct SnapshotSegment<F> {
     file: F,
     header: SegmentHeader,
@@ -46,6 +63,52 @@ impl<F: SegmentFile> SnapshotSegment<F> {
             header,
             descriptor,
         })
+    }
+}
+
+impl<F: SegmentFile> SegmentFile for BufferedSegmentFile<F> {
+    fn len(&self) -> std::io::Result<u64> {
+        Ok(self.base_len + self.buffered_tail.len() as u64)
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        if offset < self.base_len {
+            return self.file.read_at(offset, buf);
+        }
+
+        let tail_offset = (offset - self.base_len) as usize;
+        if tail_offset >= self.buffered_tail.len() {
+            return Ok(0);
+        }
+
+        let available = self.buffered_tail.len() - tail_offset;
+        let to_copy = available.min(buf.len());
+        buf[..to_copy].copy_from_slice(&self.buffered_tail[tail_offset..tail_offset + to_copy]);
+        Ok(to_copy)
+    }
+
+    fn append_all(&mut self, _buf: &[u8]) -> std::io::Result<()> {
+        unreachable!("tail snapshots are read-only")
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        unreachable!("tail snapshots are read-only")
+    }
+
+    fn sync(&mut self) -> std::io::Result<()> {
+        unreachable!("tail snapshots are read-only")
+    }
+
+    fn truncate(&mut self, _len: u64) -> std::io::Result<()> {
+        unreachable!("tail snapshots are read-only")
+    }
+
+    fn advise_sequential(&self) -> std::io::Result<()> {
+        self.file.advise_sequential()
+    }
+
+    fn prefetch(&self, offset: u64, len: u64) -> std::io::Result<()> {
+        self.file.prefetch(offset, len)
     }
 }
 
@@ -160,6 +223,58 @@ pub(crate) fn snapshot_segments<D: SegmentDirectory>(
             });
         }
 
+        let segment = SnapshotSegment::open(file, header)?;
+
+        if let Some(previous_end_lsn) = previous_end_lsn {
+            if segment.descriptor.base_lsn < previous_end_lsn {
+                return Err(WalError::SegmentOrderingViolation);
+            }
+        }
+
+        previous_end_lsn = Some(segment.descriptor.written_end_lsn()?);
+        segments.push(segment);
+    }
+
+    Ok(segments)
+}
+
+pub(crate) fn snapshot_segments_with_buffer<D: SegmentDirectory>(
+    directory: &D,
+    expected_identity: WalIdentity,
+    active_buffer: Option<(u64, u64, Vec<u8>)>,
+) -> Result<Vec<SnapshotSegment<BufferedSegmentFile<D::File>>>, WalError> {
+    let metas = directory.list_segments()?;
+    let mut segments = Vec::with_capacity(metas.len());
+    let mut previous_end_lsn = None;
+
+    for meta in metas {
+        let file = directory.open_segment(meta.segment_id)?;
+        let header = read_segment_header(&file)?;
+
+        if header.segment_id != meta.segment_id || header.base_lsn != meta.base_lsn {
+            return Err(WalError::FilenameHeaderMismatch);
+        }
+
+        if header.identity() != expected_identity {
+            return Err(WalError::IdentityMismatch {
+                expected: expected_identity,
+                found: header.identity(),
+            });
+        }
+
+        let actual_file_len = file.len()?;
+        let (base_len, buffered_tail) = match &active_buffer {
+            Some((segment_id, base_len, bytes)) if *segment_id == meta.segment_id => {
+                if *base_len > actual_file_len {
+                    return Err(WalError::ShortRead);
+                }
+
+                (*base_len, bytes.clone())
+            }
+            _ => (actual_file_len, Vec::new()),
+        };
+
+        let file = BufferedSegmentFile::new(file, base_len, buffered_tail);
         let segment = SnapshotSegment::open(file, header)?;
 
         if let Some(previous_end_lsn) = previous_end_lsn {
