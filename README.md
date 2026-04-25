@@ -367,6 +367,92 @@ record 2 header at LSN record_1_total_len
 record 2 payload
 ```
 
+The most important distinction is **logical WAL position** versus **physical file offset**.
+
+```mermaid
+flowchart LR
+    A[Unified Logical WAL Space] --> B[LSN 0<br/>record header]
+    B --> C[record payload]
+    C --> D[optional padding]
+    D --> E[next record header]
+
+    F[Physical Segment File] --> G[segment header<br/>68 bytes]
+    G --> H[record bytes]
+    H --> I[payload bytes]
+    I --> J[padding bytes]
+
+    B -. maps to .-> H
+```
+
+Segment headers exist on disk, but they are not part of the logical WAL stream. That keeps LSNs stable across segment boundaries. The logical stream is only the sequence of records and optional record padding.
+
+For a record inside a segment:
+
+```text
+physical_file_offset = SEGMENT_HEADER_LEN + (record_lsn - segment_base_lsn)
+```
+
+That formula is why every segment stores its `base_lsn`. The segment says, "the first record byte in this file corresponds to this logical LSN."
+
+### Why LSNs are byte offsets
+
+A-WAL uses byte-offset LSNs instead of record numbers because byte offsets make several things precise:
+
+- recovery can detect non-contiguous history,
+- `read_at(lsn)` can validate that the caller points at a record header,
+- `iter_from(lsn)` can resume at an exact replay position,
+- segment rollover can preserve one unified logical stream,
+- retention can reason about segment end LSNs,
+- future readers can store durable replay progress as a single number.
+
+Record numbers are easier to read, but byte offsets are a better storage contract.
+
+### LSN progression example
+
+Assume:
+
+- record header length is 32 bytes,
+- payload is 16 bytes,
+- record alignment is disabled.
+
+Then each record is 48 logical bytes.
+
+```text
+record 1 starts at LSN 0
+record 1 ends at LSN 48
+record 2 starts at LSN 48
+record 2 ends at LSN 96
+record 3 starts at LSN 96
+```
+
+If 4096-byte alignment is enabled, padding after a record also counts in LSN space. That is deliberate: the next record header is still found by adding the physical record length.
+
+### LSN vocabulary
+
+Several fields in the WAL are LSN-shaped, but they mean different things.
+
+```mermaid
+flowchart LR
+    A["first_lsn<br/>oldest retained byte"] --> B["checkpoint_lsn<br/>latest checkpoint record"]
+    B --> C["durable_lsn<br/>synced through this byte"]
+    C --> D["next_lsn<br/>next append starts here"]
+
+    E["segment base_lsn"] -. anchors file .-> A
+    F["record lsn"] -. points at one record header .-> C
+```
+
+Important terms:
+
+- `record.lsn`: the logical byte offset of one specific record header.
+- `next_lsn`: the end of the valid WAL stream and the start position for the next append.
+- `durable_lsn`: the highest WAL position known to be persisted after `sync`.
+- `first_lsn`: the oldest retained logical position after retention pruning.
+- `segment.base_lsn`: the logical LSN represented by the first record byte in that segment file.
+- `checkpoint_lsn`: the latest checkpoint marker found during recovery.
+- `expected_lsn`: the recovery scanner's next required record position.
+
+`next_lsn` can be ahead of `durable_lsn`. That is normal when data has been appended or flushed but not synced. After a crash, recovery only trusts the maximal valid prefix it can prove from the bytes on disk.
+
 ### Record types
 
 `RecordType` wraps a `u16`.
@@ -412,6 +498,25 @@ A-WAL makes durability explicit.
 
 This distinction matters. A flushed record is not necessarily durable after a crash. The fault-injection tests explicitly model this.
 
+```mermaid
+stateDiagram-v2
+    [*] --> Accepted: append
+    Accepted --> FilePath: flush
+    FilePath --> Durable: sync
+    Durable --> [*]
+
+    Accepted: assigned LSN
+    Accepted: may still be in memory
+
+    FilePath: copied to file or OS path
+    FilePath: not a durability promise
+
+    Durable: sync completed
+    Durable: survives crash under storage model
+```
+
+This separation is especially important when benchmarking. `append-no-sync` measures how fast records can be encoded and admitted. `sync-every-record` measures durable commit latency. Those are very different workloads.
+
 ### Segments
 
 The WAL is split into sortable segment files:
@@ -435,6 +540,34 @@ The filename and segment header must agree on:
 If they disagree, the WAL treats it as corruption/operator error.
 
 Segments are not preallocated. File length means actual written bytes.
+
+```mermaid
+flowchart LR
+    S1["segment 1<br/>base_lsn = 0"] --> S2["segment 2<br/>base_lsn = 16777216"]
+    S2 --> S3["segment 3<br/>base_lsn = 33554432"]
+
+    S1 --- A["records and seal"]
+    S2 --- B["records and seal"]
+    S3 --- C["active records"]
+```
+
+Segments are physical containers. The WAL itself is one logical stream. When a segment fills, the next segment continues from the exact `next_lsn` where the previous segment ended.
+
+### Segment lifecycle
+
+```mermaid
+flowchart TD
+    A[No Active Segment] --> B[Create Segment Header]
+    B --> C[Append Records]
+    C --> D{Can fit next record<br/>plus reserved seal?}
+    D -- yes --> C
+    D -- no --> E[Append SEGMENT_SEAL]
+    E --> F[Flush and Sync Old Segment]
+    F --> G[Create Next Segment]
+    G --> C
+```
+
+A-WAL reserves room for a future seal record when admitting normal user records. That avoids ending up with a segment that is full but cannot be cleanly sealed.
 
 ### Segment seal
 
@@ -499,6 +632,22 @@ There is no serde, no bincode, no JSON, and no platform-dependent layout.
 | ...                         |
 +-----------------------------+
 ```
+
+```mermaid
+flowchart LR
+    A["segment file"] --> B["SegmentHeader<br/>68 bytes"]
+    B --> C["RecordHeader<br/>32 bytes"]
+    C --> D["Payload<br/>payload_len bytes"]
+    D --> E["Padding<br/>optional alignment bytes"]
+    E --> F["RecordHeader<br/>next record"]
+    F --> G["..."]
+```
+
+The segment header is a physical file header. It describes the file and anchors the file to the logical WAL stream with `base_lsn`.
+
+Record headers and payloads are the logical WAL stream. Their byte lengths advance `next_lsn`. Optional alignment padding also advances `next_lsn` because the next record header physically starts after that padding.
+
+That is the core reason LSNs behave like byte positions rather than like row numbers.
 
 ### Segment header
 
@@ -573,6 +722,21 @@ Record checksum covers:
 - record payload.
 
 This means changing either the header or payload is detected.
+
+```mermaid
+flowchart TD
+    A["RecordHeader<br/>checksum field set to zero"] --> C["CRC32C"]
+    B["Payload bytes"] --> C
+    C --> D["checksum stored<br/>in RecordHeader"]
+
+    E["Recovery/read"] --> F["zero checksum field again"]
+    F --> G["recompute CRC32C"]
+    G --> H{matches stored checksum?}
+    H -- yes --> I["record is structurally valid"]
+    H -- no --> J["corruption or torn write"]
+```
+
+Checksums are not used as a security primitive. They are a storage-integrity check. Their job is to catch accidental corruption, partial writes, torn records, and mismatches between the header metadata and the payload bytes.
 
 ### Compression
 
@@ -819,6 +983,36 @@ Append:
 - rolls over if the active segment cannot fit the record plus the reserved segment seal,
 - returns the record-header LSN.
 
+```mermaid
+flowchart TD
+    A[append record] --> B[validate payload size]
+    B --> C[prepare payload]
+    C --> D[ensure active segment exists]
+    D --> E{buffer has room?}
+    E -- no --> F[flush buffer]
+    E -- yes --> G{segment can fit record plus seal?}
+    F --> G
+    G -- no --> H[rollover]
+    G -- yes --> I[assign current next_lsn]
+    H --> I
+    I --> J[encode record header]
+    J --> K[compute checksum]
+    K --> L[append encoded bytes to buffer]
+    L --> M[advance next_lsn]
+    M --> N[drain full storage-write-unit chunks]
+    N --> O[return record LSN]
+```
+
+The append path is careful about ordering:
+
+1. It checks admission constraints before changing durable-visible state.
+2. It assigns the LSN from `next_lsn`.
+3. It encodes the record with that LSN inside the record header.
+4. It advances `next_lsn` only after the encoded bytes are staged.
+5. It drains complete storage-write-unit chunks during steady state.
+
+That gives callers deterministic LSNs and gives recovery enough information to reject non-contiguous or partially-written records.
+
 ### Batch append
 
 ```rust
@@ -839,6 +1033,8 @@ Batch append:
 - records batch metrics.
 
 Batch append is the better shape for commit-style durability and log ingestion.
+
+The batch path preflights the records before publishing them. That matters because a batch should not create half a logical group just because the second or third record could not be admitted. Internally, each record still gets its own header, checksum, LSN, and payload bytes; batching only improves admission and durability amortization.
 
 ### Flush
 
@@ -874,6 +1070,51 @@ wal.sync_through(target_lsn)?;
 It coordinates concurrent sync waiters so multiple threads can request durability through different LSNs while one in-flight sync can satisfy multiple waiters.
 
 Current caveat: `append()` returns the start LSN of the record. To call `sync_through` precisely, the caller must know the record's physical length and pass the end LSN. For simple code, `wal.sync()` is easier.
+
+```mermaid
+sequenceDiagram
+    participant W1 as Writer 1
+    participant W2 as Writer 2
+    participant H as WalHandle
+    participant C as SyncCoordinator
+    participant E as Wal Engine
+    participant D as Disk
+
+    W1->>H: append
+    H->>E: serialize append
+    E-->>H: LSN
+    W1->>H: sync_through LSN A
+    H->>C: register waiter A
+
+    W2->>H: sync_through LSN B
+    H->>C: register waiter B
+
+    C->>H: one sync in flight
+    H->>E: sync
+    E->>D: flush and sync segment
+    D-->>E: durable
+    E-->>H: durable_lsn
+    H->>C: publish durable_lsn
+    C-->>W1: complete if covered
+    C-->>W2: complete if covered
+```
+
+The coordinator does not make every waiting thread call `sync()` separately. It tracks the highest requested LSN and lets one sync cover multiple waiters when possible.
+
+### Concurrent reads
+
+`WalHandle` avoids holding the writer mutex while doing file reads.
+
+```mermaid
+flowchart TD
+    A[read_at or iter_from] --> B[lock WAL briefly]
+    B --> C[capture directory, identity, alignment, readable cap]
+    C --> D[unlock WAL]
+    D --> E[list/open segment snapshot]
+    E --> F[read and validate records]
+```
+
+That design matters for mixed workloads: a slow read should not block appends longer than necessary. The handle captures a snapshot plan under the mutex, then performs the actual file IO outside the critical section.
 
 ### Read at LSN
 
@@ -996,6 +1237,25 @@ The current implementation:
 
 The retention pruning path was optimized after benchmarking. The first version removed thousands of segments slowly because it repeatedly listed the directory and synced the directory per file. The current filesystem implementation does bulk removal: list once, unlink all requested segments, then sync the directory once.
 
+```mermaid
+flowchart TD
+    A[truncate_segments_before requested_lsn] --> B[combine requested floor with configured min retention]
+    B --> C{any active pins?}
+    C -- yes --> D[cap floor at oldest pinned LSN]
+    C -- no --> E[use configured floor]
+    D --> F[list segments once]
+    E --> F
+    F --> G[validate headers and identity]
+    G --> H[select sealed prefix segments ending before floor]
+    H --> I{removable segments?}
+    I -- no --> J[return 0]
+    I -- yes --> K[bulk remove segment files]
+    K --> L[sync directory once]
+    L --> M[update WAL size and first_lsn]
+```
+
+Retention is intentionally whole-segment only. This keeps pruning simple and safe: a segment is either still part of readable history, or it is entirely before the safe prune floor and can be removed.
+
 ### Retention pins
 
 ```rust
@@ -1051,6 +1311,39 @@ On open, the WAL:
 13. reconstructs active segment state,
 14. returns a `RecoveryReport`.
 
+```mermaid
+flowchart TD
+    A["open WAL"] --> B["validate config"]
+    B --> C["load wal.control if present"]
+    C --> D["list segment files"]
+    D --> E["sort by base_lsn and segment_id"]
+    E --> F["validate segment headers"]
+    F --> G["scan records in LSN order"]
+    G --> H{record header valid?}
+    H -- yes --> I{checksum valid?}
+    I -- yes --> J{record_lsn == expected_lsn?}
+    J -- yes --> K["advance expected_lsn"]
+    K --> G
+    H -- no --> L["invalid suffix or corruption"]
+    I -- no --> L
+    J -- no --> L
+    L --> M{newest tail and truncate_tail?}
+    M -- yes --> N["truncate invalid suffix"]
+    M -- no --> O["fail recovery"]
+    N --> P["reconstruct active segment"]
+    G --> Q["end of segments"]
+    Q --> P
+    P --> R["return RecoveryReport"]
+```
+
+The scan has three important invariants:
+
+- segment headers must agree with filenames and WAL identity,
+- every valid record must appear exactly at the expected LSN,
+- recovery may only discard the invalid suffix of the newest segment.
+
+Those invariants prevent the WAL from silently stitching together unrelated files, skipping missing bytes, or hiding corruption in older history.
+
 ### Recovery report
 
 ```rust
@@ -1084,6 +1377,21 @@ This handles cases like:
 - torn write,
 - checksum mismatch in the newest record,
 - flushed but unsynced suffix after crash.
+
+```mermaid
+flowchart LR
+    A["valid record"] --> B["valid record"]
+    B --> C["valid record"]
+    C --> D["partial or corrupt tail"]
+
+    D --> E{newest segment?}
+    E -- yes --> F["truncate tail"]
+    E -- no --> G["return corruption error"]
+
+    F --> H["next_lsn becomes<br/>end of last valid record"]
+```
+
+Tail repair is conservative. It does not try to rescue bytes after the first invalid record, because there is no safe way to prove that later bytes are part of the same uninterrupted WAL history.
 
 ### Sealed segment corruption
 
