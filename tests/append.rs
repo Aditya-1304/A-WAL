@@ -206,7 +206,8 @@ fn read_only_mode_rejects_append_flush_and_sync() {
 
     let append_err = wal
         .append(RecordType::new(record_types::USER_MIN), b"hello")
-        .unwrap_err();
+        .unwrap_err()
+        .into_source();
     let flush_err = wal.flush().unwrap_err();
     let sync_err = wal.sync().unwrap_err();
 
@@ -230,7 +231,8 @@ fn append_rejects_payloads_larger_than_max_record_size() {
 
     let err = wal
         .append(RecordType::new(record_types::USER_MIN), &[0u8; 17])
-        .unwrap_err();
+        .unwrap_err()
+        .into_source();
 
     assert!(matches!(
         err,

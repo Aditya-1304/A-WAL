@@ -72,7 +72,8 @@ fn shutdown_sets_clean_witness_rejects_future_appends_and_fast_restarts() {
 
     let err = wal
         .append(RecordType::new(record_types::USER_MIN + 1), b"later")
-        .unwrap_err();
+        .unwrap_err()
+        .into_source();
     assert!(matches!(err, WalError::ShutdownInProgress));
 
     let (reopened, report) = Wal::open(directory, test_dir.config(), ()).unwrap();

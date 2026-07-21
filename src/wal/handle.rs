@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use crate::wal::iterator::{BufferedSegmentFile, snapshot_segments_with_buffer};
 use crate::{
     config::WalConfig,
-    error::WalError,
+    error::{AppendFailure, WalError},
     io::directory::SegmentDirectory,
     lsn::Lsn,
     types::{RecordType, WalIdentity},
@@ -134,17 +134,28 @@ where
         Ok((Self::new(wal), report))
     }
 
-    /// append one record while holding the serialized WAL writer boundary
+    /// Append one record through the serialized WAL writer boundary.
     ///
-    /// the returned interval is produced by the WAL engine itself and therefore
-    /// includes the complete encoded record. Callers requiring durability must
-    /// synchronize through `AppendResult::end_lsn`
+    /// The result preserves whether a failure happened before the user record
+    /// acquired an extent or after its durable outcome became uncertain.
     pub fn append(
         &self,
         record_type: RecordType,
         payload: &[u8],
-    ) -> Result<AppendResult, WalError> {
+    ) -> Result<AppendResult, AppendFailure> {
         self.with_wal_mut(|wal| wal.append(record_type, payload))
+    }
+
+    /// Append and synchronously make one complete record extent durable.
+    ///
+    /// The WAL mutex covers both staging and synchronization, preventing another
+    /// handle writer from entering between those operations.
+    pub fn append_and_sync(
+        &self,
+        record_type: RecordType,
+        payload: &[u8],
+    ) -> Result<AppendResult, AppendFailure> {
+        self.with_wal_mut(|wal| wal.append_and_sync(record_type, payload))
     }
 
     pub fn append_batch(&self, records: &[(RecordType, &[u8])]) -> Result<Vec<Lsn>, WalError> {
@@ -311,15 +322,22 @@ where
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn with_wal_mut<T>(
+    /// Execute one serialized WAL mutation and publish any durable-frontier change.
+    ///
+    /// The error type is generic because ordinary WAL operations return `WalError`,
+    /// while single-record append operations return the richer `AppendFailure`.
+    fn with_wal_mut<T, E>(
         &self,
-        operation: impl FnOnce(&mut Wal<D, C>) -> Result<T, WalError>,
-    ) -> Result<T, WalError> {
+        operation: impl FnOnce(&mut Wal<D, C>) -> Result<T, E>,
+    ) -> Result<T, E> {
         let mut wal = self.lock();
         let result = operation(&mut wal);
+
         self.publish_locked_durable_lsn(&wal);
+
         drop(wal);
         self.notify_tailers();
+
         result
     }
 

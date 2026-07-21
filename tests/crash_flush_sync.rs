@@ -7,7 +7,7 @@ use std::{
 
 use wal::{
     config::{SEGMENT_HEADER_LEN, SyncPolicy, WalConfig},
-    error::WalError,
+    error::{AppendFailure, WalError},
     format::record_header::RecordHeader,
     io::fault::{CrashPlan, FaultDirectory},
     lsn::Lsn,
@@ -138,9 +138,10 @@ fn torn_flushed_suffix_recovers_maximal_valid_prefix() {
 }
 
 #[test]
-fn injected_partial_append_poison_wal_and_crash_drops_partial_bytes() {
+fn injected_partial_append_is_outcome_unknown_and_poison_wal() {
     let test_dir = TestDir::new("partial-append");
     let directory = FaultDirectory::new(test_dir.path().to_path_buf());
+
     directory.inject_partial_append(1, 5).unwrap();
 
     let mut config = test_dir.config();
@@ -148,32 +149,51 @@ fn injected_partial_append_poison_wal_and_crash_drops_partial_bytes() {
 
     let (mut wal, _) = Wal::open(directory.clone(), config, ()).unwrap();
 
-    let err = wal
+    let error = wal
         .append(RecordType::new(record_types::USER_MIN), b"hello")
         .unwrap_err();
-    assert!(matches!(
-        err,
-        WalError::FatalIo {
-            operation: "append wal bytes",
-            ..
+
+    let extent = match error {
+        AppendFailure::OutcomeUnknown { extent, source } => {
+            assert!(matches!(
+                source,
+                WalError::FatalIo {
+                    operation: "append wal bytes",
+                    ..
+                }
+            ));
+
+            extent
         }
-    ));
+
+        other => panic!("expected partial append to have unknown outcome, got {other:?}"),
+    };
+
+    assert_eq!(extent.start_lsn, Lsn::ZERO);
+    assert_eq!(extent.end_lsn, Lsn::new(37));
+    assert_eq!(wal.next_lsn(), extent.end_lsn);
+    assert_eq!(wal.durable_lsn(), Lsn::ZERO);
 
     assert_eq!(
         directory.segment_bytes(1).unwrap().len(),
         SEGMENT_HEADER_LEN as usize + 5
     );
 
+    // The previous mutating I/O failure poisoned the writer. The second user
+    // record therefore does not acquire another logical extent.
     let retry = wal
         .append(RecordType::new(record_types::USER_MIN + 1), b"later")
         .unwrap_err();
+
     assert!(matches!(
         retry,
-        WalError::FatalIo {
+        AppendFailure::NotStaged(WalError::FatalIo {
             operation: "append wal bytes",
             ..
-        }
+        })
     ));
+
+    assert_eq!(wal.next_lsn(), extent.end_lsn);
 
     drop(wal);
     directory.crash_reset(CrashPlan::drop_all_unsynced());
@@ -183,7 +203,8 @@ fn injected_partial_append_poison_wal_and_crash_drops_partial_bytes() {
         SEGMENT_HEADER_LEN as usize
     );
 
-    let (wal, report) = Wal::open(directory.clone(), test_dir.config(), ()).unwrap();
+    let (wal, report) = Wal::open(directory, test_dir.config(), ()).unwrap();
+
     assert_eq!(report.records_scanned, 0);
     assert_eq!(wal.next_lsn(), Lsn::ZERO);
 }

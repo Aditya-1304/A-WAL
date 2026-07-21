@@ -75,7 +75,8 @@ fn first_append_is_rejected_before_creating_a_segment_when_limit_is_too_small() 
 
     let err = wal
         .append(RecordType::new(record_types::USER_MIN), b"hello")
-        .unwrap_err();
+        .unwrap_err()
+        .into_source();
 
     assert!(matches!(
         err,
@@ -121,7 +122,8 @@ fn append_is_rejected_when_rollover_overhead_would_push_wal_over_limit() {
 
     let err = wal
         .append(RecordType::new(record_types::USER_MIN), &[2u8; 16])
-        .unwrap_err();
+        .unwrap_err()
+        .into_source();
 
     assert!(matches!(
         err,
@@ -170,7 +172,8 @@ fn pruning_frees_space_for_a_later_append_under_the_same_limit() {
 
     let err = wal
         .append(RecordType::new(record_types::USER_MIN), &[3u8; 16])
-        .unwrap_err();
+        .unwrap_err()
+        .into_source();
     assert!(matches!(err, WalError::WalSizeLimitExceeded { .. }));
 
     let removed = wal.truncate_segments_before(second).unwrap();

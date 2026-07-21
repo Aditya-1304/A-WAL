@@ -2,7 +2,7 @@ use std::{io, time::Instant};
 
 use crate::{
     config::{CompressionPolicy, RECORD_HEADER_LEN, SEGMENT_HEADER_LEN, SyncPolicy, WalConfig},
-    error::WalError,
+    error::{AppendFailure, WalError},
     format::{
         codec::put_u64_le,
         record_header::RecordHeader,
@@ -341,49 +341,59 @@ where
         }))
     }
 
-    /// append one record and return its exact half open logical WAL extent
+    /// append one record and return its half open logical WAL extent
     ///
-    /// success means the complete encoded record has been staged in the WAL write path
-    /// unless `SyncPolicy::Always` is configured, callers must synchronize
-    /// through `AppendResult::end_lsn` before acknowledging durable completion
+    /// with an explicit synchronization policy, success means the complete encoded
+    /// record has acquired an extent in the WAL write path. The caller must
+    /// synchronize through `AppendResult::end_lsn` before acknowledging durability.
+    ///
+    /// with `SyncPolicy::Always`, success also guarantees that the complete extent
+    /// is covered by the durable frontier
+    ///
+    /// failures preserve whether the user record was definitely not staged or
+    /// whether recovery is required to determine its durable outcome
     pub fn append(
         &mut self,
         record_type: RecordType,
         payload: &[u8],
-    ) -> Result<AppendResult, WalError> {
-        self.ensure_operational()?;
+    ) -> Result<AppendResult, AppendFailure> {
+        self.ensure_operational()
+            .map_err(AppendFailure::NotStaged)?;
 
         if payload.len() > self.config.max_record_size as usize {
-            return Err(WalError::PayloadTooLarge {
+            return Err(AppendFailure::NotStaged(WalError::PayloadTooLarge {
                 len: payload.len() as u32,
                 max: self.config.max_record_size,
-            });
+            }));
         }
 
         let original_payload_len = payload.len() as u64;
-        let (on_disk_payload, flags) = self.prepare_payload_for_append(payload)?;
-        let record_bytes = self.record_physical_len_for_payload_len(on_disk_payload.len())? as u64;
 
-        self.ensure_record_admission_within_wal_size_limit(record_bytes, true)?;
+        let (on_disk_payload, flags) = self
+            .prepare_payload_for_append(payload)
+            .map_err(AppendFailure::NotStaged)?;
 
-        let start_lsn = self.stage_record(record_type, flags, &on_disk_payload, true)?;
+        let record_bytes = self
+            .record_physical_len_for_payload_len(on_disk_payload.len())
+            .map_err(AppendFailure::NotStaged)? as u64;
 
-        // `stage_record` advances `next_lsn` only after the complete encoded record
-        // has entered the WAL write buffer. Reading the engine-owned tail here
-        // avoids duplicating framing, compression, or alignment calculations in a
-        // database caller
-        let result = AppendResult {
-            start_lsn,
-            end_lsn: self.next_lsn,
-        };
+        self.ensure_record_admission_within_wal_size_limit(record_bytes, true)
+            .map_err(AppendFailure::NotStaged)?;
 
-        self.active_segment_record_count = self
+        let extent = self.stage_record_with_extent(record_type, flags, &on_disk_payload, true)?;
+
+        // every remaining fallible operation occurs after the user record acquired
+        // its extent and must therefore preserve the outcome-unknown distinction
+        let next_record_count = self
             .active_segment_record_count
             .checked_add(1)
-            .ok_or(WalError::ReservationOverflow)?;
+            .ok_or(WalError::ReservationOverflow)
+            .map_err(|source| AppendFailure::OutcomeUnknown { extent, source })?;
+
+        self.active_segment_record_count = next_record_count;
 
         if self.first_lsn.is_none() {
-            self.first_lsn = Some(result.start_lsn);
+            self.first_lsn = Some(extent.start_lsn);
         }
 
         self.metrics.note_record_append(record_bytes);
@@ -394,10 +404,49 @@ where
         }
 
         if matches!(self.config.sync_policy, SyncPolicy::Always) {
-            self.sync()?;
+            self.sync()
+                .map_err(|source| AppendFailure::OutcomeUnknown { extent, source })?;
+
+            if !extent.is_durable_at(self.durable_lsn) {
+                return Err(AppendFailure::OutcomeUnknown {
+                    extent,
+                    source: WalError::BrokenDurabilityContract,
+                });
+            }
         }
 
-        Ok(result)
+        Ok(extent)
+    }
+
+    /// append one record and synchronously make its complete extent durable
+    ///
+    /// append and synchronization are not rollback atomic. A failure after the
+    /// record acquires an extent returns `AppendFailure::OutcomeUnknown` because
+    /// recovery may retain the record even though this call cannot acknowledge it
+    ///
+    /// this method intentionally remains synchronous. Group commit and asynchronous
+    /// durability coordination belong to later database integration phases
+    pub fn append_and_sync(
+        &mut self,
+        record_type: RecordType,
+        payload: &[u8],
+    ) -> Result<AppendResult, AppendFailure> {
+        let extent = self.append(record_type, payload)?;
+
+        // `SyncPolicy::Always` may already have made the extent durable
+        if !extent.is_durable_at(self.durable_lsn) {
+            self.sync()
+                .map_err(|source| AppendFailure::OutcomeUnknown { extent, source })?;
+        }
+
+        if !extent.is_durable_at(self.durable_lsn) {
+            return Err(AppendFailure::OutcomeUnknown {
+                extent,
+                source: WalError::BrokenDurabilityContract,
+            });
+        }
+
+        Ok(extent)
     }
 
     pub fn append_batch(&mut self, records: &[(RecordType, &[u8])]) -> Result<Vec<Lsn>, WalError> {
@@ -967,6 +1016,12 @@ where
         Ok(active_segment)
     }
 
+    /// Stage an internal or batch record while preserving the legacy `WalError`
+    /// boundary used by existing internal paths.
+    ///
+    /// Internal callers such as segment sealing do not expose their extent to a
+    /// database transaction. The single-record public append path uses
+    /// `stage_record_with_extent` directly so it can preserve outcome uncertainty.
     fn stage_record(
         &mut self,
         record_type: RecordType,
@@ -974,44 +1029,91 @@ where
         payload: &[u8],
         reserve_future_seal_space: bool,
     ) -> Result<Lsn, WalError> {
-        self.ensure_writable_segment()?;
+        self.stage_record_with_extent(record_type, flags, payload, reserve_future_seal_space)
+            .map(|extent| extent.start_lsn)
+            .map_err(AppendFailure::into_source)
+    }
 
-        let record_len = self.record_physical_len_for_payload_len(payload.len())?;
+    /// Stage one complete encoded record and preserve whether it acquired an
+    /// extent before failure.
+    ///
+    /// All failures before the write buffer accepts the complete encoded record are
+    /// classified as `NotStaged`. Once `next_lsn` advances, any draining failure is
+    /// `OutcomeUnknown` because some or all bytes may already have reached the
+    /// underlying segment file.
+    fn stage_record_with_extent(
+        &mut self,
+        record_type: RecordType,
+        flags: u16,
+        payload: &[u8],
+        reserve_future_seal_space: bool,
+    ) -> Result<AppendResult, AppendFailure> {
+        self.ensure_writable_segment()
+            .map_err(AppendFailure::NotStaged)?;
+
+        let record_len = self
+            .record_physical_len_for_payload_len(payload.len())
+            .map_err(AppendFailure::NotStaged)?;
 
         if self.write_buffer.len() + record_len > self.config.write_buffer_size {
-            self.flush()?;
+            self.flush().map_err(AppendFailure::NotStaged)?;
         }
 
-        if reserve_future_seal_space && !self.active_segment_can_fit(record_len as u64, true)? {
+        if reserve_future_seal_space
+            && !self
+                .active_segment_can_fit(record_len as u64, true)
+                .map_err(AppendFailure::NotStaged)?
+        {
             if self.active_segment_is_empty() {
-                return Err(WalError::invalid_config(
-                    "target_segment_size must leave room for one maximum sized record plus a trailing SEGMENT_SEAL record",
-                ));
+                return Err(AppendFailure::NotStaged(WalError::invalid_config(
+                    "target_segment_size must leave room for one maximum sized \
+                     record plus a trailing SEGMENT_SEAL record",
+                )));
             }
 
-            self.rollover()?;
+            // Rollover may mutate internal WAL metadata, but the caller's user
+            // record has not acquired an extent yet. Any failure remains
+            // `NotStaged`, while the underlying WAL error still carries sticky-fatal
+            // state where appropriate.
+            self.rollover().map_err(AppendFailure::NotStaged)?;
         }
 
-        if !self.active_segment_can_fit(record_len as u64, reserve_future_seal_space)? {
-            return Err(WalError::invalid_config(
+        if !self
+            .active_segment_can_fit(record_len as u64, reserve_future_seal_space)
+            .map_err(AppendFailure::NotStaged)?
+        {
+            return Err(AppendFailure::NotStaged(WalError::invalid_config(
                 "active segment cannot fit staged record",
-            ));
+            )));
         }
 
-        let lsn = self.next_lsn;
-        let encoded_record = self.encode_record_bytes(record_type, flags, payload, lsn)?;
+        let start_lsn = self.next_lsn;
+
+        let encoded_record = self
+            .encode_record_bytes(record_type, flags, payload, start_lsn)
+            .map_err(AppendFailure::NotStaged)?;
+
+        // Calculate the complete end before mutating the write buffer. An LSN
+        // overflow must remain a deterministic not-staged failure.
+        let end_lsn = start_lsn
+            .checked_add_bytes(encoded_record.len() as u64)
+            .ok_or(WalError::ReservationOverflow)
+            .map_err(AppendFailure::NotStaged)?;
 
         self.write_buffer
             .append(&encoded_record)
-            .map_err(buffer_error_to_wal)?;
+            .map_err(buffer_error_to_wal)
+            .map_err(AppendFailure::NotStaged)?;
 
-        self.next_lsn = self
-            .next_lsn
-            .checked_add_bytes(encoded_record.len() as u64)
-            .ok_or(WalError::ReservationOverflow)?;
+        self.next_lsn = end_lsn;
 
-        self.drain_buffer(true)?;
-        Ok(lsn)
+        let extent = AppendResult { start_lsn, end_lsn };
+
+        if let Err(source) = self.drain_buffer(true) {
+            return Err(AppendFailure::OutcomeUnknown { extent, source });
+        }
+
+        Ok(extent)
     }
 
     fn rollover(&mut self) -> Result<(), WalError> {
@@ -2069,7 +2171,8 @@ mod tests {
 
         let append_err = wal
             .append(RecordType::new(record_types::USER_MIN), b"third")
-            .unwrap_err();
+            .unwrap_err()
+            .into_source();
         let flush_err = wal.flush().unwrap_err();
         let second_sync_err = wal.sync().unwrap_err();
         let shutdown_err = wal.shutdown().unwrap_err();

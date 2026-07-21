@@ -1,6 +1,6 @@
 use std::{fmt, io};
 
-use crate::{lsn::Lsn, types::WalIdentity};
+use crate::{lsn::Lsn, types::WalIdentity, wal::engine::AppendResult};
 
 #[derive(Debug)]
 pub enum WalError {
@@ -72,6 +72,86 @@ pub enum WalError {
         reason: String,
     },
     ReservationOverflow,
+}
+
+/// failure classification for a single record WAL append
+///
+/// this type preserves whether the caller can safely conclude that the user
+/// record was not appended or whether recovery is required to determine its
+/// durable outcome
+#[derive(Debug, Clone)]
+pub enum AppendFailure {
+    /// the user record did not acquire a logical WAL extent
+    ///
+    /// the underlying error may still have placed the WAL in sticky-fatal
+    /// state. For example, rollover metadata can encounter mutating I/O before
+    /// the user record itself is staged
+    NotStaged(WalError),
+
+    /// the user record acquired an extent, but the process cannot prove whether
+    /// that complete extent reached stable storage
+    ///
+    /// callers must not treat this result as an ordinary abort or automatically
+    /// retry the logical operation. Recovery must first determine the durable
+    /// prefix
+    OutcomeUnknown {
+        /// exact logical interval assigned to the staged user record
+        extent: AppendResult,
+
+        /// failure that prevented the WAL from proving durability
+        source: WalError,
+    },
+}
+
+impl AppendFailure {
+    /// this consumes the classification and return its underlying WAL error
+    ///
+    /// this is useful for legacy diagnostics and tests Transactional
+    /// callers must inspect the classification before discarding it
+    pub fn into_source(self) -> WalError {
+        match self {
+            Self::NotStaged(source) | Self::OutcomeUnknown { source, .. } => source,
+        }
+    }
+
+    /// return the assigned extent when the append outcome is unknown
+    pub const fn extent(&self) -> Option<AppendResult> {
+        match self {
+            Self::NotStaged(_) => None,
+            Self::OutcomeUnknown { extent, .. } => Some(*extent),
+        }
+    }
+
+    /// borrow the underlying WAL error without discarding classification
+    pub const fn wal_error(&self) -> &WalError {
+        match self {
+            Self::NotStaged(source) | Self::OutcomeUnknown { source, .. } => source,
+        }
+    }
+}
+
+impl fmt::Display for AppendFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotStaged(source) => {
+                write!(formatter, "WAL append was not staged: {source}")
+            }
+
+            Self::OutcomeUnknown { extent, source } => write!(
+                formatter,
+                "WAL append outcome is unknown for logical extent [{}, {}): {}",
+                extent.start_lsn.as_u64(),
+                extent.end_lsn.as_u64(),
+                source
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AppendFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.wal_error())
+    }
 }
 
 impl Clone for WalError {
