@@ -367,14 +367,9 @@ where
         let sync_target = requested_lsn.min(wal.next_lsn());
 
         wal.sync()?;
+        wal.verify_durable_through(sync_target)?;
 
-        let durable_lsn = wal.durable_lsn();
-
-        if durable_lsn < sync_target {
-            return Err(WalError::BrokenDurabilityContract);
-        }
-
-        Ok(durable_lsn)
+        Ok(wal.durable_lsn())
     }
 
     fn tail_snapshot_plan(&self) -> Result<TailSnapshotPlan<D>, WalError> {

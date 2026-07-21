@@ -380,16 +380,18 @@ where
         self.ensure_record_admission_within_wal_size_limit(record_bytes, true)
             .map_err(AppendFailure::NotStaged)?;
 
+        // Record-count overflow is deterministic and must be rejected before
+        // the user record acquires an extent. The calculation is destination
+        // aware so a valid rollover begins from the new segment's zero count.
+        let next_record_count = self
+            .preflight_next_user_record_count(record_bytes)
+            .map_err(AppendFailure::NotStaged)?;
+
         let extent = self.stage_record_with_extent(record_type, flags, &on_disk_payload, true)?;
 
-        // every remaining fallible operation occurs after the user record acquired
-        // its extent and must therefore preserve the outcome-unknown distinction
-        let next_record_count = self
-            .active_segment_record_count
-            .checked_add(1)
-            .ok_or(WalError::ReservationOverflow)
-            .map_err(|source| AppendFailure::OutcomeUnknown { extent, source })?;
-
+        // Staging may have performed a rollover and reset the active segment
+        // count. Assign the precomputed destination count only after the user
+        // record has been staged successfully.
         self.active_segment_record_count = next_record_count;
 
         if self.first_lsn.is_none() {
@@ -407,12 +409,8 @@ where
             self.sync()
                 .map_err(|source| AppendFailure::OutcomeUnknown { extent, source })?;
 
-            if !extent.is_durable_at(self.durable_lsn) {
-                return Err(AppendFailure::OutcomeUnknown {
-                    extent,
-                    source: WalError::BrokenDurabilityContract,
-                });
-            }
+            self.verify_durable_through(extent.end_lsn)
+                .map_err(|source| AppendFailure::OutcomeUnknown { extent, source })?;
         }
 
         Ok(extent)
@@ -439,12 +437,8 @@ where
                 .map_err(|source| AppendFailure::OutcomeUnknown { extent, source })?;
         }
 
-        if !extent.is_durable_at(self.durable_lsn) {
-            return Err(AppendFailure::OutcomeUnknown {
-                extent,
-                source: WalError::BrokenDurabilityContract,
-            });
-        }
+        self.verify_durable_through(extent.end_lsn)
+            .map_err(|source| AppendFailure::OutcomeUnknown { extent, source })?;
 
         Ok(extent)
     }
@@ -589,6 +583,19 @@ where
     pub fn sync(&mut self) -> Result<(), WalError> {
         self.ensure_operational()?;
         self.sync_inner()
+    }
+
+    /// Verify that stable storage covers the complete requested logical extent.
+    ///
+    /// Falling behind the requested frontier after synchronization is a broken
+    /// durability contract. The WAL therefore enters sticky-fatal state and
+    /// rejects later mutations until reopen and recovery.
+    pub(crate) fn verify_durable_through(&mut self, target_lsn: Lsn) -> Result<(), WalError> {
+        if self.durable_lsn >= target_lsn {
+            return Ok(());
+        }
+
+        Err(self.mark_broken_durability_contract())
     }
 
     pub fn shutdown(&mut self) -> Result<(), WalError> {
@@ -961,6 +968,32 @@ where
         }
 
         Ok(growth)
+    }
+
+    /// Calculate the destination segment's record count before staging a user
+    /// record.
+    ///
+    /// Record counts belong to individual segments. If the record will roll
+    /// into a new segment, its count starts from zero rather than inheriting the
+    /// previous segment's count. Keeping this validation ahead of staging
+    /// ensures deterministic overflow cannot assign a logical extent.
+    fn preflight_next_user_record_count(&self, record_len: u64) -> Result<u64, WalError> {
+        let starts_new_segment = match self.active_segment.as_ref() {
+            None => true,
+            Some(_) => {
+                !self.active_segment_is_empty() && !self.active_segment_can_fit(record_len, true)?
+            }
+        };
+
+        let destination_record_count = if starts_new_segment {
+            0
+        } else {
+            self.active_segment_record_count
+        };
+
+        destination_record_count
+            .checked_add(1)
+            .ok_or(WalError::ReservationOverflow)
     }
 
     fn ensure_writable_segment(&mut self) -> Result<(), WalError> {
@@ -1376,6 +1409,23 @@ where
         }
 
         WalError::fatal_io(operation, source)
+    }
+
+    /// Enter sticky-fatal state after detecting an impossible durability result.
+    ///
+    /// A successful synchronization operation that leaves the durable frontier
+    /// behind its requested target makes subsequent write acknowledgements
+    /// unsafe. The writer must remain fail-stopped until reopen and recovery
+    /// reconstruct the last trustworthy durable prefix.
+    fn mark_broken_durability_contract(&mut self) -> WalError {
+        if self.fatal_state.is_none() {
+            self.fatal_state = Some(StickyFatalState {
+                operation: "verify durable frontier",
+                safe_lsn: self.durable_lsn,
+            });
+        }
+
+        WalError::BrokenDurabilityContract
     }
 
     fn promote_mutating_error(&mut self, operation: &'static str, err: WalError) -> WalError {
@@ -2220,5 +2270,110 @@ mod tests {
         assert_eq!(first_seen.lsn, first_lsn);
         assert_eq!(first_seen.payload, b"first");
         assert!(iter.next().unwrap().is_none());
+    }
+
+    #[test]
+    fn broken_durability_contract_enters_sticky_fatal_state() {
+        let test_dir = TestDir::new("broken-durability-contract");
+        let mut wal = open_test_wal(&test_dir);
+
+        let extent = wal
+            .append(RecordType::new(record_types::USER_MIN), b"uncertain")
+            .unwrap();
+
+        assert_eq!(wal.durable_lsn(), Lsn::ZERO);
+        assert!(extent.end_lsn > wal.durable_lsn());
+
+        // Simulate the defensive post-sync condition where the storage operation
+        // reported success but the durable frontier did not cover the requested
+        // record extent.
+        let error = wal.verify_durable_through(extent.end_lsn).unwrap_err();
+
+        assert!(matches!(error, WalError::BrokenDurabilityContract));
+
+        // Once the durability contract is broken, reads and recovery must be
+        // limited to the last known-safe durable prefix.
+        assert_eq!(wal.readable_cap_lsn(), Some(Lsn::ZERO));
+
+        let next_lsn_before_retry = wal.next_lsn();
+
+        // The writer must fail-stop rather than accept a second record while its
+        // durable state is uncertain.
+        let retry = wal
+            .append(
+                RecordType::new(record_types::USER_MIN + 1),
+                b"must-not-stage",
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            retry,
+            AppendFailure::NotStaged(WalError::FatalIo {
+                operation: "verify durable frontier",
+                ..
+            })
+        ));
+
+        assert_eq!(wal.next_lsn(), next_lsn_before_retry);
+    }
+
+    #[test]
+    fn record_count_overflow_is_rejected_before_staging_without_blocking_rollover() {
+        let same_segment_dir = TestDir::new("record-count-overflow");
+        let mut same_segment_wal = open_test_wal(&same_segment_dir);
+
+        let _first_extent = same_segment_wal
+            .append(RecordType::new(record_types::USER_MIN), b"first")
+            .unwrap();
+
+        same_segment_wal.active_segment_record_count = u64::MAX;
+
+        let next_lsn_before_rejection = same_segment_wal.next_lsn();
+        let buffered_bytes_before_rejection = same_segment_wal.buffered_bytes();
+
+        let error = same_segment_wal
+            .append(RecordType::new(record_types::USER_MIN + 1), b"second")
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppendFailure::NotStaged(WalError::ReservationOverflow)
+        ));
+
+        // A deterministic preflight rejection must not assign logical space or
+        // place any bytes into the active write buffer.
+        assert_eq!(same_segment_wal.next_lsn(), next_lsn_before_rejection);
+        assert_eq!(
+            same_segment_wal.buffered_bytes(),
+            buffered_bytes_before_rejection
+        );
+
+        let rollover_dir = TestDir::new("record-count-overflow-rollover");
+        let mut config = rollover_dir.config();
+        config.max_record_size = 16;
+        config.target_segment_size = SEGMENT_HEADER_LEN + 48 + 56;
+
+        let (mut rollover_wal, _report) = Wal::open(
+            FsSegmentDirectory::new(rollover_dir.path().to_path_buf()),
+            config,
+            (),
+        )
+        .unwrap();
+
+        let _first_extent = rollover_wal
+            .append(RecordType::new(record_types::USER_MIN), &[1_u8; 16])
+            .unwrap();
+
+        rollover_wal.active_segment_record_count = u64::MAX;
+
+        // The old segment count must not reject a record that belongs to a new
+        // segment. Rollover resets the destination segment's record count.
+        let second_extent = rollover_wal
+            .append(RecordType::new(record_types::USER_MIN + 1), &[2_u8; 16])
+            .unwrap();
+
+        assert_eq!(rollover_wal.active_segment_id(), Some(2));
+        assert_eq!(rollover_wal.active_segment_record_count, 1);
+        assert_eq!(second_extent.end_lsn, rollover_wal.next_lsn());
     }
 }
