@@ -60,7 +60,8 @@ fn flush_only_record_is_lost_after_crash_reset() {
     let (mut wal, _) = Wal::open(directory.clone(), test_dir.config(), ()).unwrap();
     let lsn = wal
         .append(RecordType::new(record_types::USER_MIN), b"hello")
-        .unwrap();
+        .unwrap()
+        .start_lsn;
     wal.flush().unwrap();
 
     drop(wal);
@@ -84,7 +85,8 @@ fn synced_record_survives_crash_reset() {
     let (mut wal, _) = Wal::open(directory.clone(), test_dir.config(), ()).unwrap();
     let lsn = wal
         .append(RecordType::new(record_types::USER_MIN), b"hello")
-        .unwrap();
+        .unwrap()
+        .start_lsn;
     wal.sync().unwrap();
 
     drop(wal);
@@ -107,12 +109,14 @@ fn torn_flushed_suffix_recovers_maximal_valid_prefix() {
 
     let first_lsn = wal
         .append(RecordType::new(record_types::USER_MIN), b"first")
-        .unwrap();
+        .unwrap()
+        .start_lsn;
     wal.sync().unwrap();
 
     let second_lsn = wal
         .append(RecordType::new(record_types::USER_MIN + 1), b"second")
-        .unwrap();
+        .unwrap()
+        .start_lsn;
     wal.flush().unwrap();
 
     drop(wal);

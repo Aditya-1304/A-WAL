@@ -380,7 +380,8 @@ fn handle_round_trips_append_sync_and_read_paths() {
 
     let lsn = handle
         .append(RecordType::new(record_types::USER_MIN), b"hello")
-        .unwrap();
+        .unwrap()
+        .start_lsn;
 
     assert_eq!(handle.durable_lsn(), Lsn::ZERO);
 
@@ -404,7 +405,8 @@ fn durable_lsn_returns_without_waiting_for_in_flight_sync() {
 
     handle
         .append(RecordType::new(record_types::USER_MIN), b"hello")
-        .unwrap();
+        .unwrap()
+        .start_lsn;
 
     directory.block_next_sync();
     let sync_join = {
@@ -455,7 +457,8 @@ fn concurrent_appends_through_handle_produce_unique_ordered_lsns() {
             let payload = format!("record-{i}").into_bytes();
             let lsn = handle
                 .append(RecordType::new(record_types::USER_MIN + i), &payload)
-                .unwrap();
+                .unwrap()
+                .start_lsn;
 
             (lsn, payload)
         }));
@@ -511,7 +514,8 @@ fn sync_through_returns_immediately_when_target_is_already_durable() {
 
     let lsn = handle
         .append(RecordType::new(record_types::USER_MIN), b"hello")
-        .unwrap();
+        .unwrap()
+        .start_lsn;
 
     handle.sync().unwrap();
     let sync_calls_before = handle.metrics().sync_calls;
@@ -535,7 +539,8 @@ fn sync_through_rejects_lsn_beyond_next_lsn() {
 
     handle
         .append(RecordType::new(record_types::USER_MIN), b"hello")
-        .unwrap();
+        .unwrap()
+        .start_lsn;
 
     let err = handle.sync_through(Lsn::new(38)).unwrap_err();
 
@@ -610,7 +615,8 @@ fn tail_from_reads_existing_and_future_records() {
 
     let first = handle
         .append(RecordType::new(record_types::USER_MIN), b"first")
-        .unwrap();
+        .unwrap()
+        .start_lsn;
 
     let mut tail = handle.tail_from(first).unwrap();
 
@@ -621,7 +627,8 @@ fn tail_from_reads_existing_and_future_records() {
 
     handle
         .append(RecordType::new(record_types::USER_MIN + 1), b"second")
-        .unwrap();
+        .unwrap()
+        .start_lsn;
 
     let second_seen = tail.next_blocking(Duration::from_secs(1)).unwrap().unwrap();
 
@@ -665,6 +672,7 @@ fn tail_next_blocking_wakes_after_concurrent_append() {
             handle
                 .append(RecordType::new(record_types::USER_MIN), b"wake me")
                 .unwrap()
+                .start_lsn
         })
     };
 
@@ -895,7 +903,8 @@ fn read_at_does_not_hold_wal_mutex_during_file_io() {
 
     let first_lsn = handle
         .append(RecordType::new(record_types::USER_MIN), b"first")
-        .unwrap();
+        .unwrap()
+        .start_lsn;
 
     handle.sync().unwrap();
 
@@ -917,7 +926,8 @@ fn read_at_does_not_hold_wal_mutex_during_file_io() {
         thread::spawn(move || {
             let appended_lsn = handle
                 .append(RecordType::new(record_types::USER_MIN + 1), b"second")
-                .unwrap();
+                .unwrap()
+                .start_lsn;
 
             append_done_tx.send(appended_lsn).unwrap();
 

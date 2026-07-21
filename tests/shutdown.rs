@@ -61,7 +61,8 @@ fn shutdown_sets_clean_witness_rejects_future_appends_and_fast_restarts() {
     let (mut wal, _) = Wal::open(directory.clone(), test_dir.config(), ()).unwrap();
     let user_lsn = wal
         .append(RecordType::new(record_types::USER_MIN), b"hello")
-        .unwrap();
+        .unwrap()
+        .start_lsn;
     let next_before_shutdown = wal.next_lsn();
 
     wal.shutdown().unwrap();
@@ -93,7 +94,8 @@ fn read_only_fast_restart_preserves_clean_shutdown_flag() {
 
     let (mut wal, _) = Wal::open(directory.clone(), test_dir.config(), ()).unwrap();
     wal.append(RecordType::new(record_types::USER_MIN), b"hello")
-        .unwrap();
+        .unwrap()
+        .start_lsn;
     wal.shutdown().unwrap();
 
     let mut config = test_dir.config();

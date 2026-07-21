@@ -70,13 +70,16 @@ fn truncate_segments_before_removes_whole_sealed_prefix_and_updates_first_lsn() 
 
     let first = wal
         .append(RecordType::new(record_types::USER_MIN), &[1u8; 16])
-        .unwrap();
+        .unwrap()
+        .start_lsn;
     let second = wal
         .append(RecordType::new(record_types::USER_MIN), &[2u8; 16])
-        .unwrap();
+        .unwrap()
+        .start_lsn;
     let third = wal
         .append(RecordType::new(record_types::USER_MIN), &[3u8; 16])
-        .unwrap();
+        .unwrap()
+        .start_lsn;
 
     wal.sync().unwrap();
 
@@ -117,7 +120,8 @@ fn truncate_segments_before_does_not_remove_the_only_active_segment() {
 
     let first = wal
         .append(RecordType::new(record_types::USER_MIN), &[9u8; 16])
-        .unwrap();
+        .unwrap()
+        .start_lsn;
 
     let size_before = wal.current_wal_size();
     let removed = wal.truncate_segments_before(Lsn::new(10_000)).unwrap();

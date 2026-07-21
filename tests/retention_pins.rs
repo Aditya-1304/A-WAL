@@ -72,13 +72,16 @@ fn retention_pin_blocks_pruning_until_guard_is_dropped() {
 
     let first = wal
         .append(RecordType::new(record_types::USER_MIN), &[1u8; 16])
-        .unwrap();
+        .unwrap()
+        .start_lsn;
     let second = wal
         .append(RecordType::new(record_types::USER_MIN), &[2u8; 16])
-        .unwrap();
+        .unwrap()
+        .start_lsn;
     let third = wal
         .append(RecordType::new(record_types::USER_MIN), &[3u8; 16])
-        .unwrap();
+        .unwrap()
+        .start_lsn;
 
     wal.sync().unwrap();
 

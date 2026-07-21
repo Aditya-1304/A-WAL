@@ -125,7 +125,8 @@ fn reservation_abort_restores_pre_reservation_state_without_holes() {
 
     let lsn = wal
         .append(RecordType::new(record_types::USER_MIN + 1), b"after")
-        .unwrap();
+        .unwrap()
+        .start_lsn;
     assert_eq!(lsn, Lsn::ZERO);
 }
 
@@ -143,7 +144,8 @@ fn dropping_reservation_aborts_implicitly() {
 
     let lsn = wal
         .append(RecordType::new(record_types::USER_MIN + 1), b"later")
-        .unwrap();
+        .unwrap()
+        .start_lsn;
     assert_eq!(lsn, Lsn::ZERO);
 }
 
@@ -167,7 +169,8 @@ fn reservation_shrinks_unused_reserved_tail_before_publish() {
 
     let third = wal
         .append(RecordType::new(record_types::USER_MIN + 2), b"c")
-        .unwrap();
+        .unwrap()
+        .start_lsn;
 
     assert_eq!(third, Lsn::new(66));
 }

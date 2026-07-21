@@ -9,7 +9,7 @@ use crate::{
     lsn::Lsn,
     types::{RecordType, WalIdentity},
     wal::{
-        engine::Wal,
+        engine::{AppendResult, Wal},
         iterator::{
             SnapshotSegment, WalIterator, WalRecord, read_record_at_snapshot, snapshot_segments,
             snapshot_segments_through,
@@ -134,7 +134,16 @@ where
         Ok((Self::new(wal), report))
     }
 
-    pub fn append(&self, record_type: RecordType, payload: &[u8]) -> Result<Lsn, WalError> {
+    /// append one record while holding the serialized WAL writer boundary
+    ///
+    /// the returned interval is produced by the WAL engine itself and therefore
+    /// includes the complete encoded record. Callers requiring durability must
+    /// synchronize through `AppendResult::end_lsn`
+    pub fn append(
+        &self,
+        record_type: RecordType,
+        payload: &[u8],
+    ) -> Result<AppendResult, WalError> {
         self.with_wal_mut(|wal| wal.append(record_type, payload))
     }
 

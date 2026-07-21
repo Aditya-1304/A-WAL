@@ -81,6 +81,34 @@ struct StickyFatalState {
     safe_lsn: Lsn,
 }
 
+/// exact half open logiacl WAL interval assigned to one appended record
+///
+/// `start_lsn` identifies the record header and is the value used by point reads.
+/// `end_lsn` is the first logical byte after the complete encoded record, including
+/// header, encoded payload, checksum and alignment padding
+///
+/// segment headers consume physical file space byt do not consume logical LSN space
+/// if append triggers a rollover, the preceding segement seal is also excluded
+/// from this use record interval
+#[must_use = "append extents contain the exact durability boundary"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppendResult {
+    /// logical LSN at which the appended record header begins
+    pub start_lsn: Lsn,
+
+    /// first logical LSN after the complete encoded record
+    pub end_lsn: Lsn,
+}
+
+impl AppendResult {
+    /// return whether the complete record is covered by `durable_lsn`
+    ///
+    /// durability must be checked against `end_lsn`. Reaching `start_lsn`
+    /// proves only that the durable prefix reached the record header boundary
+    pub const fn is_durable_at(self, durable_lsn: Lsn) -> bool {
+        durable_lsn.0 >= self.end_lsn.0
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReservationSnapshot {
     pub next_lsn: Lsn,
@@ -313,7 +341,16 @@ where
         }))
     }
 
-    pub fn append(&mut self, record_type: RecordType, payload: &[u8]) -> Result<Lsn, WalError> {
+    /// append one record and return its exact half open logical WAL extent
+    ///
+    /// success means the complete encoded record has been staged in the WAL write path
+    /// unless `SyncPolicy::Always` is configured, callers must synchronize
+    /// through `AppendResult::end_lsn` before acknowledging durable completion
+    pub fn append(
+        &mut self,
+        record_type: RecordType,
+        payload: &[u8],
+    ) -> Result<AppendResult, WalError> {
         self.ensure_operational()?;
 
         if payload.len() > self.config.max_record_size as usize {
@@ -329,7 +366,16 @@ where
 
         self.ensure_record_admission_within_wal_size_limit(record_bytes, true)?;
 
-        let lsn = self.stage_record(record_type, flags, &on_disk_payload, true)?;
+        let start_lsn = self.stage_record(record_type, flags, &on_disk_payload, true)?;
+
+        // `stage_record` advances `next_lsn` only after the complete encoded record
+        // has entered the WAL write buffer. Reading the engine-owned tail here
+        // avoids duplicating framing, compression, or alignment calculations in a
+        // database caller
+        let result = AppendResult {
+            start_lsn,
+            end_lsn: self.next_lsn,
+        };
 
         self.active_segment_record_count = self
             .active_segment_record_count
@@ -337,7 +383,7 @@ where
             .ok_or(WalError::ReservationOverflow)?;
 
         if self.first_lsn.is_none() {
-            self.first_lsn = Some(lsn);
+            self.first_lsn = Some(result.start_lsn);
         }
 
         self.metrics.note_record_append(record_bytes);
@@ -351,7 +397,7 @@ where
             self.sync()?;
         }
 
-        Ok(lsn)
+        Ok(result)
     }
 
     pub fn append_batch(&mut self, records: &[(RecordType, &[u8])]) -> Result<Vec<Lsn>, WalError> {
@@ -1854,7 +1900,8 @@ mod tests {
 
         let lsn = wal
             .append(RecordType::new(record_types::USER_MIN), b"hello")
-            .unwrap();
+            .unwrap()
+            .start_lsn;
 
         assert_eq!(lsn, Lsn::ZERO);
         assert_eq!(wal.first_lsn(), Some(Lsn::ZERO));
@@ -1871,7 +1918,8 @@ mod tests {
         let mut wal = open_test_wal(&test_dir);
 
         wal.append(RecordType::new(record_types::USER_MIN), b"hello")
-            .unwrap();
+            .unwrap()
+            .start_lsn;
         wal.flush().unwrap();
 
         assert_eq!(wal.buffered_bytes(), 0);
@@ -1888,7 +1936,8 @@ mod tests {
         let mut wal = open_test_wal(&test_dir);
 
         wal.append(RecordType::new(record_types::USER_MIN), b"hello")
-            .unwrap();
+            .unwrap()
+            .start_lsn;
         wal.sync().unwrap();
 
         assert_eq!(wal.buffered_bytes(), 0);
@@ -1912,7 +1961,8 @@ mod tests {
         .unwrap();
 
         wal.append(RecordType::new(record_types::USER_MIN), &[7u8; 600])
-            .unwrap();
+            .unwrap()
+            .start_lsn;
 
         assert_eq!(wal.current_wal_size(), SEGMENT_HEADER_LEN + 512);
         assert_eq!(wal.buffered_bytes(), 120);
@@ -1938,10 +1988,12 @@ mod tests {
 
         let first_lsn = wal
             .append(RecordType::new(record_types::USER_MIN), &[1u8; 16])
-            .unwrap();
+            .unwrap()
+            .start_lsn;
         let second_lsn = wal
             .append(RecordType::new(record_types::USER_MIN), &[2u8; 16])
-            .unwrap();
+            .unwrap()
+            .start_lsn;
 
         assert_eq!(first_lsn, Lsn::ZERO);
         assert_eq!(second_lsn, Lsn::new(104));
@@ -1969,7 +2021,8 @@ mod tests {
         {
             let mut wal = open_test_wal(&test_dir);
             wal.append(RecordType::new(record_types::USER_MIN), b"hello")
-                .unwrap();
+                .unwrap()
+                .start_lsn;
             wal.sync().unwrap();
             assert_eq!(wal.next_lsn(), Lsn::new(37));
         }
@@ -1996,12 +2049,14 @@ mod tests {
 
         let first_lsn = wal
             .append(RecordType::new(record_types::USER_MIN), b"first")
-            .unwrap();
+            .unwrap()
+            .start_lsn;
         wal.sync().unwrap();
 
         let second_lsn = wal
             .append(RecordType::new(record_types::USER_MIN), b"second")
-            .unwrap();
+            .unwrap()
+            .start_lsn;
 
         let sync_err = wal.sync().unwrap_err();
         assert!(matches!(

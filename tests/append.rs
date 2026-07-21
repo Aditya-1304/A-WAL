@@ -84,10 +84,12 @@ fn append_assigns_contiguous_lsns_in_logical_byte_space() {
 
     let first = wal
         .append(RecordType::new(record_types::USER_MIN), &[1u8; 8])
-        .unwrap();
+        .unwrap()
+        .start_lsn;
     let second = wal
         .append(RecordType::new(record_types::USER_MIN), &[2u8; 16])
-        .unwrap();
+        .unwrap()
+        .start_lsn;
 
     assert_eq!(first, Lsn::ZERO);
     assert_eq!(second, Lsn::new(40));
@@ -103,7 +105,8 @@ fn flush_drains_tail_bytes_without_advancing_durable_frontier() {
     let mut wal = open_wal(&test_dir);
 
     wal.append(RecordType::new(record_types::USER_MIN), b"hello")
-        .unwrap();
+        .unwrap()
+        .start_lsn;
 
     assert_eq!(wal.current_wal_size(), SEGMENT_HEADER_LEN);
     assert_eq!(wal.buffered_bytes(), 37);
@@ -125,7 +128,8 @@ fn sync_forces_small_tail_to_disk_and_advances_durable_frontier() {
     let mut wal = open_wal(&test_dir);
 
     wal.append(RecordType::new(record_types::USER_MIN), b"hello")
-        .unwrap();
+        .unwrap()
+        .start_lsn;
     wal.sync().unwrap();
 
     assert_eq!(wal.buffered_bytes(), 0);
@@ -150,7 +154,8 @@ fn steady_state_drain_prefers_storage_write_unit_multiples() {
     .unwrap();
 
     wal.append(RecordType::new(record_types::USER_MIN), &[7u8; 600])
-        .unwrap();
+        .unwrap()
+        .start_lsn;
 
     assert_eq!(wal.current_wal_size(), SEGMENT_HEADER_LEN + 512);
     assert_eq!(wal.buffered_bytes(), 120);
@@ -176,7 +181,8 @@ fn sync_policy_always_makes_append_durable_immediately() {
 
     let lsn = wal
         .append(RecordType::new(record_types::USER_MIN), b"hello")
-        .unwrap();
+        .unwrap()
+        .start_lsn;
 
     assert_eq!(lsn, Lsn::ZERO);
     assert_eq!(wal.next_lsn(), Lsn::new(37));
@@ -239,7 +245,8 @@ fn reopen_restores_latest_next_lsn_from_segment_lengths() {
     {
         let mut wal = open_wal(&test_dir);
         wal.append(RecordType::new(record_types::USER_MIN), b"hello")
-            .unwrap();
+            .unwrap()
+            .start_lsn;
         wal.sync().unwrap();
 
         assert_eq!(wal.first_lsn(), Some(Lsn::ZERO));

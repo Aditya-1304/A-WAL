@@ -269,7 +269,6 @@ fn bench_concurrent_sync_through(args: &Args) -> BenchResult<BenchRow> {
 
     let per_thread = (args.sync_records / args.threads).max(1);
     let total_records = per_thread * args.threads;
-    let record_len = physical_record_len(args.payload_size, config.record_alignment);
     let barrier = Arc::new(Barrier::new(args.threads + 1));
 
     let mut joins = Vec::new();
@@ -284,13 +283,12 @@ fn bench_concurrent_sync_through(args: &Args) -> BenchResult<BenchRow> {
 
             for _ in 0..per_thread {
                 let op = Instant::now();
-                let lsn = wal
+                let extent = wal
                     .append(RecordType::new(record_types::USER_MIN), &payload)
-                    .map_err(|e| e.to_string())?;
-                let end_lsn = lsn
-                    .checked_add_bytes(record_len)
-                    .ok_or_else(|| "lsn overflow".to_string())?;
-                wal.sync_through(end_lsn).map_err(|e| e.to_string())?;
+                    .map_err(|error| error.to_string())?;
+
+                wal.sync_through(extent.end_lsn)
+                    .map_err(|error| error.to_string())?;
                 latencies.push(ns(op.elapsed()));
             }
 

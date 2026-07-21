@@ -115,7 +115,8 @@ fn append_is_rejected_when_rollover_overhead_would_push_wal_over_limit() {
     .unwrap();
 
     wal.append(RecordType::new(record_types::USER_MIN), &[1u8; 16])
-        .unwrap();
+        .unwrap()
+        .start_lsn;
     wal.sync().unwrap();
 
     let err = wal
@@ -159,10 +160,12 @@ fn pruning_frees_space_for_a_later_append_under_the_same_limit() {
 
     let _first = wal
         .append(RecordType::new(record_types::USER_MIN), &[1u8; 16])
-        .unwrap();
+        .unwrap()
+        .start_lsn;
     let second = wal
         .append(RecordType::new(record_types::USER_MIN), &[2u8; 16])
-        .unwrap();
+        .unwrap()
+        .start_lsn;
     wal.sync().unwrap();
 
     let err = wal
@@ -176,7 +179,8 @@ fn pruning_frees_space_for_a_later_append_under_the_same_limit() {
 
     let third = wal
         .append(RecordType::new(record_types::USER_MIN), &[3u8; 16])
-        .unwrap();
+        .unwrap()
+        .start_lsn;
 
     assert_eq!(third, Lsn::new(208));
 }

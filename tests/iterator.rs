@@ -187,7 +187,8 @@ fn read_at_returns_exact_record_after_sync() {
 
     let lsn = wal
         .append(RecordType::new(record_types::USER_MIN), b"hello")
-        .unwrap();
+        .unwrap()
+        .start_lsn;
     wal.sync().unwrap();
 
     let record = wal.read_at(lsn).unwrap();
@@ -204,7 +205,8 @@ fn read_at_rejects_middle_of_record() {
     let mut wal = open_wal(&test_dir);
 
     wal.append(RecordType::new(record_types::USER_MIN), b"hello")
-        .unwrap();
+        .unwrap()
+        .start_lsn;
     wal.sync().unwrap();
 
     let err = wal.read_at(Lsn::new(1)).unwrap_err();
@@ -219,10 +221,12 @@ fn iter_from_yields_records_in_order_within_one_segment() {
 
     let first_lsn = wal
         .append(RecordType::new(record_types::USER_MIN), b"hello")
-        .unwrap();
+        .unwrap()
+        .start_lsn;
     let second_lsn = wal
         .append(RecordType::new(record_types::USER_MIN + 1), b"world!")
-        .unwrap();
+        .unwrap()
+        .start_lsn;
     wal.sync().unwrap();
 
     let mut iter = wal.iter_from(first_lsn).unwrap();
@@ -249,10 +253,12 @@ fn iter_from_crosses_segment_rollover_and_yields_segment_seal() {
 
     let first_lsn = wal
         .append(RecordType::new(record_types::USER_MIN), &[1u8; 16])
-        .unwrap();
+        .unwrap()
+        .start_lsn;
     let second_lsn = wal
         .append(RecordType::new(record_types::USER_MIN + 1), &[2u8; 16])
-        .unwrap();
+        .unwrap()
+        .start_lsn;
     wal.sync().unwrap();
 
     let mut iter = wal.iter_from(Lsn::ZERO).unwrap();
@@ -300,9 +306,11 @@ fn read_at_can_target_segment_seal_record_after_rollover() {
     let mut wal = open_wal_with_config(&test_dir, config);
 
     wal.append(RecordType::new(record_types::USER_MIN), &[1u8; 16])
-        .unwrap();
+        .unwrap()
+        .start_lsn;
     wal.append(RecordType::new(record_types::USER_MIN + 1), &[2u8; 16])
-        .unwrap();
+        .unwrap()
+        .start_lsn;
     wal.sync().unwrap();
 
     let record = wal.read_at(Lsn::new(48)).unwrap();
@@ -322,7 +330,8 @@ fn iter_from_written_end_is_empty() {
     let mut wal = open_wal(&test_dir);
 
     wal.append(RecordType::new(record_types::USER_MIN), b"hello")
-        .unwrap();
+        .unwrap()
+        .start_lsn;
     wal.sync().unwrap();
 
     let mut iter = wal.iter_from(wal.next_lsn()).unwrap();

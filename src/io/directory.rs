@@ -378,7 +378,7 @@ fn wal_error_to_invalid_data(err: WalError) -> io::Error {
 mod tests {
     use super::*;
     use crate::{
-        format::segment_header::{compression_algorithms, SegmentHeader},
+        format::segment_header::{SegmentHeader, compression_algorithms},
         io::segment_file::SegmentFile,
         types::WalIdentity,
     };
