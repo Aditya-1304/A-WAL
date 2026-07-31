@@ -79,7 +79,7 @@ fn shutdown_sets_clean_witness_rejects_future_appends_and_fast_restarts() {
     let (reopened, report) = Wal::open(directory, test_dir.config(), ()).unwrap();
 
     assert!(report.clean_shutdown);
-    assert!(report.recovery_skipped);
+    assert!(!report.recovery_skipped);
     assert!(reopened.next_lsn() > next_before_shutdown);
     assert_eq!(reopened.read_at(user_lsn).unwrap().payload, b"hello");
 
@@ -105,6 +105,6 @@ fn read_only_fast_restart_preserves_clean_shutdown_flag() {
     let (_wal, report) = Wal::open(directory, config, ()).unwrap();
 
     assert!(report.clean_shutdown);
-    assert!(report.recovery_skipped);
+    assert!(!report.recovery_skipped);
     assert!(control_store.read().unwrap().unwrap().clean_shutdown);
 }

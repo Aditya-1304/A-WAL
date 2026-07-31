@@ -15,6 +15,7 @@ use crate::{
     lsn::Lsn,
     types::{RecordType, SegmentId, record_types},
     wal::{
+        engine::SegmentSealPayload,
         recovery_observer::{RecoveryCallbacks, RecoveryObserver},
         report::RecoveryReport,
         segment::{ActiveSegment, SegmentDescriptor},
@@ -44,12 +45,14 @@ struct SegmentScanResult {
     valid_end_offset: u64,
     record_count: u64,
     last_valid_record_type: Option<RecordType>,
+    seal_seen: bool,
     tail_error_lsn: Option<Lsn>,
     tail_error: Option<WalError>,
 }
 
 struct ValidatedRecord {
     header: RecordHeader,
+    payload: Vec<u8>,
     next_file_offset: u64,
     next_lsn: Lsn,
 }
@@ -106,7 +109,10 @@ pub(crate) fn recover_with_observer<D: SegmentDirectory>(
     let mut current_wal_size = 0u64;
     let mut last_kept_segment: Option<RecoveredSegment<D::File>> = None;
     let mut checkpoint_lsns = BTreeSet::new();
-    let mut previous_end_lsn = None;
+    // retention may remove an arbitrary sealed prefix, so the first retained
+    // segment need not have ID one or base LSN zero. once that first segment is
+    // established, every later segment must form one exact adjacent history
+    let mut previous_segment_boundary: Option<(SegmentId, Lsn)> = None;
 
     for (index, meta) in metas.iter().enumerate() {
         let is_latest = index + 1 == metas.len();
@@ -118,7 +124,7 @@ pub(crate) fn recover_with_observer<D: SegmentDirectory>(
             config,
             &mut report,
             &mut checkpoint_lsns,
-            previous_end_lsn,
+            previous_segment_boundary,
             control_checkpoint,
             observer,
         )?;
@@ -127,7 +133,10 @@ pub(crate) fn recover_with_observer<D: SegmentDirectory>(
             continue;
         };
 
-        previous_end_lsn = Some(recovered.descriptor.written_end_lsn()?);
+        previous_segment_boundary = Some((
+            recovered.descriptor.segment_id,
+            recovered.descriptor.written_end_lsn()?,
+        ));
         current_wal_size = current_wal_size
             .checked_add(recovered.descriptor.file_len)
             .ok_or(WalError::ReservationOverflow)?;
@@ -182,7 +191,7 @@ fn recover_segment<D: SegmentDirectory>(
     config: &WalConfig,
     report: &mut RecoveryReport,
     checkpoint_lsns: &mut BTreeSet<Lsn>,
-    previous_end_lsn: Option<Lsn>,
+    previous_segment_boundary: Option<(SegmentId, Lsn)>,
     control_checkpoint: Option<(Lsn, u64)>,
     observer: RecoveryCallbacks<'_>,
 ) -> Result<Option<RecoveredSegment<D::File>>, WalError> {
@@ -195,17 +204,20 @@ fn recover_segment<D: SegmentDirectory>(
 
     let header = match read_segment_header(&file) {
         Ok(header) => header,
-        Err(err) => {
-            return handle_invalid_newest_header(
-                directory,
-                meta,
-                is_latest,
-                config,
-                report,
-                original_file_len,
-                err,
-                observer,
-            );
+
+        Err(source) => {
+            observer.on_corruption_found(meta.base_lsn, &source);
+            report.note_corruption();
+
+            // canonical segment creation publishes a fully written and synced
+            // header through atomic rename. Therefore, an invalid canonical
+            // header is not a repairable torn record tail. deleting it could
+            // silently discard an entire durable segment
+            if is_latest {
+                return Err(source);
+            }
+
+            return Err(WalError::CorruptionInSealedSegment);
         }
     };
 
@@ -220,12 +232,24 @@ fn recover_segment<D: SegmentDirectory>(
         });
     }
 
+    // Sealed state is established only after the physical seal record and its
+    // payload have been validated. File position alone must never imply that a
+    // historical segment was completed.
     let mut descriptor =
-        SegmentDescriptor::from_header_with_sealed(&header, original_file_len, !is_latest)?;
+        SegmentDescriptor::from_header_with_sealed(&header, original_file_len, false)?;
 
-    if let Some(previous_end_lsn) = previous_end_lsn {
-        if descriptor.base_lsn < previous_end_lsn {
-            return Err(WalError::SegmentOrderingViolation);
+    if let Some((previous_segment_id, previous_end_lsn)) = previous_segment_boundary {
+        let expected_segment_id = previous_segment_id
+            .checked_add(1)
+            .ok_or(WalError::ReservationOverflow)?;
+
+        if descriptor.segment_id != expected_segment_id || descriptor.base_lsn != previous_end_lsn {
+            return Err(WalError::SegmentContinuityViolation {
+                expected_segment_id,
+                found_segment_id: descriptor.segment_id,
+                expected_base_lsn: previous_end_lsn,
+                found_base_lsn: descriptor.base_lsn,
+            });
         }
     }
 
@@ -268,6 +292,16 @@ fn recover_segment<D: SegmentDirectory>(
         descriptor.set_file_len(scan.valid_end_offset)?;
         observer.on_truncation(corruption_lsn, truncated_bytes);
         report.note_truncation(truncated_bytes);
+    }
+
+    if !is_latest && !scan.seal_seen {
+        return Err(WalError::MissingSegmentSeal {
+            segment_id: descriptor.segment_id,
+        });
+    }
+
+    if scan.seal_seen {
+        descriptor.mark_sealed();
     }
 
     Ok(Some(RecoveredSegment {
@@ -326,6 +360,7 @@ fn scan_segment<F: SegmentFile>(
     let mut expected_lsn = descriptor.base_lsn;
     let mut record_count = 0u64;
     let mut last_valid_record_type = None;
+    let mut seal_seen = false;
 
     while file_offset < descriptor.file_len {
         match validate_record_at(
@@ -338,6 +373,18 @@ fn scan_segment<F: SegmentFile>(
             record_alignment,
         ) {
             Ok(record) => {
+                if seal_seen {
+                    return Err(WalError::RecordAfterSegmentSeal {
+                        segment_id: descriptor.segment_id,
+                        lsn: record.header.lsn,
+                    });
+                }
+
+                if record.header.record_type == record_types::SEGMENT_SEAL {
+                    validate_segment_seal(descriptor, &record, record_count)?;
+                    seal_seen = true;
+                }
+
                 report.note_record_scanned(record.header.lsn);
                 observer.on_records_scanned(report.records_scanned, record.header.lsn);
 
@@ -356,11 +403,13 @@ fn scan_segment<F: SegmentFile>(
                 file_offset = record.next_file_offset;
                 expected_lsn = record.next_lsn;
             }
+
             Err(err) => {
                 return Ok(SegmentScanResult {
                     valid_end_offset: file_offset,
                     record_count,
                     last_valid_record_type,
+                    seal_seen,
                     tail_error_lsn: Some(expected_lsn),
                     tail_error: Some(err),
                 });
@@ -372,8 +421,100 @@ fn scan_segment<F: SegmentFile>(
         valid_end_offset: file_offset,
         record_count,
         last_valid_record_type,
+        seal_seen,
         tail_error_lsn: None,
         tail_error: None,
+    })
+}
+
+fn validate_segment_seal(
+    descriptor: &SegmentDescriptor,
+    record: &ValidatedRecord,
+    preceding_record_count: u64,
+) -> Result<(), WalError> {
+    let seal = decode_segment_seal(descriptor.segment_id, &record.payload)?;
+
+    let preceding_logical_bytes = record
+        .header
+        .lsn
+        .checked_distance_from(descriptor.base_lsn)
+        .ok_or_else(|| WalError::InvalidSegmentSeal {
+            segment_id: descriptor.segment_id,
+            reason: format!(
+                "seal LSN {} precedes segment base LSN {}",
+                record.header.lsn.as_u64(),
+                descriptor.base_lsn.as_u64(),
+            ),
+        })?;
+
+    if seal.segment_id != descriptor.segment_id {
+        return Err(WalError::InvalidSegmentSeal {
+            segment_id: descriptor.segment_id,
+            reason: format!(
+                "payload names segment {}, expected {}",
+                seal.segment_id, descriptor.segment_id,
+            ),
+        });
+    }
+
+    if seal.record_count != preceding_record_count {
+        return Err(WalError::InvalidSegmentSeal {
+            segment_id: descriptor.segment_id,
+            reason: format!(
+                "payload records {}, but recovery counted {} records before the seal",
+                seal.record_count, preceding_record_count,
+            ),
+        });
+    }
+
+    if seal.logical_bytes != preceding_logical_bytes {
+        return Err(WalError::InvalidSegmentSeal {
+            segment_id: descriptor.segment_id,
+            reason: format!(
+                "payload covers {} logical bytes, but the seal begins after {} bytes",
+                seal.logical_bytes, preceding_logical_bytes,
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn decode_segment_seal(
+    segment_id: SegmentId,
+    payload: &[u8],
+) -> Result<SegmentSealPayload, WalError> {
+    if payload.len() != SegmentSealPayload::ENCODED_LEN {
+        return Err(WalError::InvalidSegmentSeal {
+            segment_id,
+            reason: format!(
+                "payload length is {}, expected {}",
+                payload.len(),
+                SegmentSealPayload::ENCODED_LEN,
+            ),
+        });
+    }
+
+    let stored_segment_id = u64::from_le_bytes(
+        payload[0..8]
+            .try_into()
+            .expect("segment-seal segment ID has a fixed validated width"),
+    );
+    let record_count = u64::from_le_bytes(
+        payload[8..16]
+            .try_into()
+            .expect("segment-seal record count has a fixed validated width"),
+    );
+    let logical_bytes = u64::from_le_bytes(
+        payload[16..24]
+            .try_into()
+            .expect("segment-seal logical length has a fixed validated width"),
+    );
+
+    Ok(SegmentSealPayload {
+        segment_id: stored_segment_id,
+        record_count,
+        logical_bytes,
     })
 }
 
@@ -434,6 +575,7 @@ fn validate_record_at<F: SegmentFile>(
 
     Ok(ValidatedRecord {
         header,
+        payload,
         next_file_offset,
         next_lsn,
     })

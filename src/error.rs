@@ -59,6 +59,36 @@ pub enum WalError {
     },
     ReadOnlyViolation,
     SegmentOrderingViolation,
+
+    /// two retained WAL segments do not form one exact physical history
+    ///
+    /// the first retained segment may begin above segment one after legitimate
+    /// retention. Every later segment must have the immediately following
+    /// segment ID and must begin at the previous segment's exact logical end
+    SegmentContinuityViolation {
+        expected_segment_id: u64,
+        found_segment_id: u64,
+        expected_base_lsn: Lsn,
+        found_base_lsn: Lsn,
+    },
+
+    /// historical segment ended without its required `SEGMENT_SEAL`
+    MissingSegmentSeal {
+        segment_id: u64,
+    },
+
+    /// `SEGMENT_SEAL` payload does not describe the bytes preceding it
+    InvalidSegmentSeal {
+        segment_id: u64,
+        reason: String,
+    },
+
+    /// physical record was found after a segment's terminal seal
+    RecordAfterSegmentSeal {
+        segment_id: u64,
+        lsn: Lsn,
+    },
+
     FilenameHeaderMismatch,
     ReadOnlyTailCorruption,
     CorruptionInSealedSegment,
@@ -222,6 +252,32 @@ impl Clone for WalError {
 
             Self::SegmentOrderingViolation => Self::SegmentOrderingViolation,
 
+            Self::SegmentContinuityViolation {
+                expected_segment_id,
+                found_segment_id,
+                expected_base_lsn,
+                found_base_lsn,
+            } => Self::SegmentContinuityViolation {
+                expected_segment_id: *expected_segment_id,
+                found_segment_id: *found_segment_id,
+                expected_base_lsn: *expected_base_lsn,
+                found_base_lsn: *found_base_lsn,
+            },
+
+            Self::MissingSegmentSeal { segment_id } => Self::MissingSegmentSeal {
+                segment_id: *segment_id,
+            },
+
+            Self::InvalidSegmentSeal { segment_id, reason } => Self::InvalidSegmentSeal {
+                segment_id: *segment_id,
+                reason: reason.clone(),
+            },
+
+            Self::RecordAfterSegmentSeal { segment_id, lsn } => Self::RecordAfterSegmentSeal {
+                segment_id: *segment_id,
+                lsn: *lsn,
+            },
+
             Self::FilenameHeaderMismatch => Self::FilenameHeaderMismatch,
 
             Self::ReadOnlyTailCorruption => Self::ReadOnlyTailCorruption,
@@ -263,6 +319,15 @@ impl WalError {
 
     pub fn fatal_io(operation: &'static str, source: io::Error) -> Self {
         Self::FatalIo { operation, source }
+    }
+
+    /// Return whether this error proves the live writer is fail-stopped.
+    ///
+    /// A `NotStaged` append remains a definite rejection for the user record,
+    /// but a fatal source means the shared WAL handle still requires reopen and
+    /// recovery before any later database operation can be trusted.
+    pub const fn requires_recovery(&self) -> bool {
+        matches!(self, Self::FatalIo { .. } | Self::BrokenDurabilityContract)
     }
 }
 
@@ -324,6 +389,44 @@ impl fmt::Display for WalError {
             }
             WalError::ReadOnlyViolation => write!(f, "operation is not allowed in read-only mode"),
             WalError::SegmentOrderingViolation => write!(f, "segment ordering violation"),
+
+            WalError::SegmentContinuityViolation {
+                expected_segment_id,
+                found_segment_id,
+                expected_base_lsn,
+                found_base_lsn,
+            } => write!(
+                f,
+                "WAL segment continuity violation: expected segment {} at base LSN {}, \
+                 found segment {} at base LSN {}",
+                expected_segment_id,
+                expected_base_lsn.as_u64(),
+                found_segment_id,
+                found_base_lsn.as_u64(),
+            ),
+
+            WalError::MissingSegmentSeal { segment_id } => {
+                write!(
+                    f,
+                    "historical WAL segment {segment_id} is missing its terminal segment seal"
+                )
+            }
+
+            WalError::InvalidSegmentSeal { segment_id, reason } => {
+                write!(
+                    f,
+                    "WAL segment {segment_id} contains an invalid segment seal: {reason}"
+                )
+            }
+
+            WalError::RecordAfterSegmentSeal { segment_id, lsn } => {
+                write!(
+                    f,
+                    "WAL segment {segment_id} contains a record at LSN {} after its terminal seal",
+                    lsn.as_u64(),
+                )
+            }
+
             WalError::FilenameHeaderMismatch => write!(f, "filename/header mismatch"),
             WalError::ReadOnlyTailCorruption => {
                 write!(f, "tail corruption detected in read-only mode")

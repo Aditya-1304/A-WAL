@@ -10,7 +10,7 @@ use crate::{
     },
     io::{
         buffer::{AppendBuffer, AppendBufferError},
-        control_file::{ControlFile, FsControlFileStore},
+        control_file::FsControlFileStore,
         directory::{NewSegment, SegmentDirectory},
         segment_file::SegmentFile,
     },
@@ -28,9 +28,7 @@ use crate::{
         retention::{RetentionState, execute_truncate_plan, plan_truncate_segments_before},
         retention_pin::RetentionPinGuard,
         segment::ActiveSegment,
-        shutdown::{
-            CheckpointState, clear_clean_shutdown, find_shutdown_tail, publish_clean_shutdown,
-        },
+        shutdown::{CheckpointState, clear_clean_shutdown, publish_clean_shutdown},
     },
 };
 
@@ -180,18 +178,11 @@ where
         let prior_control = control_store.load_for_recovery(config.identity)?;
         let write_buffer = AppendBuffer::new(config.write_buffer_size);
 
-        let recovered = match prior_control
-            .as_ref()
-            .filter(|control| control.clean_shutdown)
-        {
-            Some(control) => {
-                match Self::try_open_clean_shutdown_fast_path(&directory, &config, control)? {
-                    Some(recovered) => recovered,
-                    None => recover_with_observer(&directory, &control_store, &config, observer)?,
-                }
-            }
-            None => recover_with_observer(&directory, &control_store, &config, observer)?,
-        };
+        // A clean-shutdown witness proves that shutdown publication completed;
+        // it does not prove that every older segment still exists or remains
+        // unmodified. Recovery therefore validates the complete retained
+        // history on every open.
+        let recovered = recover_with_observer(&directory, &control_store, &config, observer)?;
 
         let RecoveredWal {
             active_segment,
@@ -244,101 +235,6 @@ where
         };
 
         Ok((wal, report))
-    }
-
-    fn try_open_clean_shutdown_fast_path(
-        directory: &D,
-        config: &WalConfig,
-        control: &ControlFile,
-    ) -> Result<Option<RecoveredWal<D::File>>, WalError> {
-        let started = Instant::now();
-
-        let Some(shutdown_tail) = find_shutdown_tail(
-            directory,
-            config.identity,
-            config.max_record_size,
-            config.record_alignment,
-        )?
-        else {
-            return Ok(None);
-        };
-
-        let metas = directory.list_segments()?;
-        let Some(latest_meta) = metas.last() else {
-            return Ok(None);
-        };
-
-        if latest_meta.segment_id != shutdown_tail.segment_id {
-            return Ok(None);
-        }
-
-        let mut current_wal_size = 0u64;
-        let mut first_lsn = None;
-
-        for meta in &metas {
-            let file = directory.open_segment(meta.segment_id)?;
-            let file_len = file.len()?;
-
-            current_wal_size = current_wal_size
-                .checked_add(file_len)
-                .ok_or(WalError::ReservationOverflow)?;
-
-            if first_lsn.is_none() && file_len > SEGMENT_HEADER_LEN {
-                first_lsn = Some(meta.base_lsn);
-            }
-        }
-
-        let latest_file = directory.open_segment(latest_meta.segment_id)?;
-        let latest_header = match read_segment_header(&latest_file) {
-            Ok(header) => header,
-            Err(err) if is_io_like(&err) => return Err(err),
-            Err(_) => return Ok(None),
-        };
-
-        if latest_header.segment_id != latest_meta.segment_id
-            || latest_header.base_lsn != latest_meta.base_lsn
-        {
-            return Ok(None);
-        }
-
-        if latest_header.identity() != config.identity {
-            return Ok(None);
-        }
-
-        let active_segment = match ActiveSegment::open(latest_file, latest_header) {
-            Ok(segment) => segment,
-            Err(err) if is_io_like(&err) => return Err(err),
-            Err(_) => return Ok(None),
-        };
-
-        let next_segment_id = latest_meta
-            .segment_id
-            .checked_add(1)
-            .ok_or(WalError::ReservationOverflow)?;
-        let next_lsn = shutdown_tail.next_lsn;
-
-        let mut report = RecoveryReport::empty();
-        report.segments_scanned = 1;
-        report.records_scanned = shutdown_tail.record_count;
-        report.first_lsn = first_lsn;
-        report.last_valid_lsn = Some(shutdown_tail.shutdown_lsn);
-        report.set_next_lsn(next_lsn);
-        report.set_checkpoint_lsn(control.last_checkpoint_lsn);
-        report.set_segments_prunable(0);
-        report.set_recovery_duration(started.elapsed());
-        report.mark_clean_shutdown(true);
-        report.mark_recovery_skipped(true);
-
-        Ok(Some(RecoveredWal {
-            active_segment: Some(active_segment),
-            first_lsn,
-            next_lsn,
-            durable_lsn: next_lsn,
-            current_wal_size,
-            next_segment_id,
-            active_segment_record_count: shutdown_tail.record_count,
-            report,
-        }))
     }
 
     /// append one record and return its half open logical WAL extent
