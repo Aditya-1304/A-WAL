@@ -233,7 +233,7 @@ impl Clone for WalError {
             Self::DiskFull => Self::DiskFull,
 
             Self::FatalIo { operation, source } => Self::FatalIo {
-                operation: *operation,
+                operation,
                 source: clone_io_error(source),
             },
 

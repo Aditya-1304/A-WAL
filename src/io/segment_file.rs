@@ -8,6 +8,9 @@ use std::{
 
 pub trait SegmentFile {
     fn len(&self) -> io::Result<u64>;
+    fn is_empty(&self) -> io::Result<bool> {
+        self.len().map(|length| length == 0)
+    }
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize>;
     fn append_all(&mut self, buf: &[u8]) -> io::Result<()>;
     fn flush(&mut self) -> io::Result<()>;

@@ -204,9 +204,9 @@ fn read_at_rejects_middle_of_record() {
     let test_dir = TestDir::new("middle");
     let mut wal = open_wal(&test_dir);
 
-    wal.append(RecordType::new(record_types::USER_MIN), b"hello")
-        .unwrap()
-        .start_lsn;
+    let _ = wal
+        .append(RecordType::new(record_types::USER_MIN), b"hello")
+        .unwrap();
     wal.sync().unwrap();
 
     let err = wal.read_at(Lsn::new(1)).unwrap_err();
@@ -305,12 +305,12 @@ fn read_at_can_target_segment_seal_record_after_rollover() {
 
     let mut wal = open_wal_with_config(&test_dir, config);
 
-    wal.append(RecordType::new(record_types::USER_MIN), &[1u8; 16])
-        .unwrap()
-        .start_lsn;
-    wal.append(RecordType::new(record_types::USER_MIN + 1), &[2u8; 16])
-        .unwrap()
-        .start_lsn;
+    let _ = wal
+        .append(RecordType::new(record_types::USER_MIN), &[1u8; 16])
+        .unwrap();
+    let _ = wal
+        .append(RecordType::new(record_types::USER_MIN + 1), &[2u8; 16])
+        .unwrap();
     wal.sync().unwrap();
 
     let record = wal.read_at(Lsn::new(48)).unwrap();
@@ -329,9 +329,9 @@ fn iter_from_written_end_is_empty() {
     let test_dir = TestDir::new("end");
     let mut wal = open_wal(&test_dir);
 
-    wal.append(RecordType::new(record_types::USER_MIN), b"hello")
-        .unwrap()
-        .start_lsn;
+    let _ = wal
+        .append(RecordType::new(record_types::USER_MIN), b"hello")
+        .unwrap();
     wal.sync().unwrap();
 
     let mut iter = wal.iter_from(wal.next_lsn()).unwrap();

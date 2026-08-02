@@ -73,20 +73,20 @@ fn main() -> BenchResult<()> {
     println!("Point reads: {}", args.point_reads);
     println!();
 
-    let mut rows = Vec::new();
-
-    rows.push(bench_append_no_sync(&args)?);
-    rows.push(bench_sync_every_record(&args)?);
-    rows.push(bench_batch_append_sync(&args)?);
-    rows.push(bench_concurrent_sync_through(&args)?);
-    rows.push(bench_rollover(&args)?);
-    rows.push(bench_recovery_scan(&args)?);
-    rows.push(bench_iterator_replay(&args)?);
-    rows.push(bench_point_reads(&args)?);
-    rows.push(bench_retention_prune(&args)?);
-    rows.push(bench_tail_follow(&args)?);
-    rows.push(bench_corrupt_tail_repair(&args)?);
-    rows.push(bench_clean_shutdown_reopen(&args)?);
+    let rows = vec![
+        bench_append_no_sync(&args)?,
+        bench_sync_every_record(&args)?,
+        bench_batch_append_sync(&args)?,
+        bench_concurrent_sync_through(&args)?,
+        bench_rollover(&args)?,
+        bench_recovery_scan(&args)?,
+        bench_iterator_replay(&args)?,
+        bench_point_reads(&args)?,
+        bench_retention_prune(&args)?,
+        bench_tail_follow(&args)?,
+        bench_corrupt_tail_repair(&args)?,
+        bench_clean_shutdown_reopen(&args)?,
+    ];
 
     print_rows(&rows);
 
@@ -113,7 +113,7 @@ impl Args {
             sync_records: 2_000,
             payload_size: 1024,
             batch_size: 128,
-            threads: thread::available_parallelism()?.get().min(8).max(1),
+            threads: thread::available_parallelism()?.get().clamp(1, 8),
             point_reads: 10_000,
         };
 
@@ -181,7 +181,7 @@ fn bench_append_no_sync(args: &Args) -> BenchResult<BenchRow> {
     let started = Instant::now();
     for _ in 0..args.records {
         let op = Instant::now();
-        wal.append(RecordType::new(record_types::USER_MIN), &payload)?;
+        let _extent = wal.append(RecordType::new(record_types::USER_MIN), &payload)?;
         latencies.push(ns(op.elapsed()));
     }
     let duration = started.elapsed();
@@ -209,7 +209,7 @@ fn bench_sync_every_record(args: &Args) -> BenchResult<BenchRow> {
     let started = Instant::now();
     for _ in 0..args.sync_records {
         let op = Instant::now();
-        wal.append(RecordType::new(record_types::USER_MIN), &payload)?;
+        let _extent = wal.append(RecordType::new(record_types::USER_MIN), &payload)?;
         wal.sync()?;
         latencies.push(ns(op.elapsed()));
     }
@@ -335,7 +335,7 @@ fn bench_rollover(args: &Args) -> BenchResult<BenchRow> {
     let started = Instant::now();
     for _ in 0..records {
         let op = Instant::now();
-        wal.append(RecordType::new(record_types::USER_MIN), &payload)?;
+        let _extent = wal.append(RecordType::new(record_types::USER_MIN), &payload)?;
         latencies.push(ns(op.elapsed()));
     }
     let duration = started.elapsed();
@@ -497,7 +497,7 @@ fn bench_tail_follow(args: &Args) -> BenchResult<BenchRow> {
             payload[..8].copy_from_slice(&(seq as u64).to_le_bytes());
 
             writer_stamps[seq].store(ns(bench_origin.elapsed()), Ordering::Release);
-            wal_for_writer
+            let _extent = wal_for_writer
                 .append(RecordType::new(record_types::USER_MIN), &payload)
                 .map_err(|e| e.to_string())?;
         }
@@ -697,7 +697,7 @@ fn fresh_dir(args: &Args, name: &str) -> BenchResult<PathBuf> {
     Ok(dir)
 }
 
-fn repeated_batch<'a>(n: usize, payload: &'a [u8]) -> Vec<(RecordType, &'a [u8])> {
+fn repeated_batch(n: usize, payload: &[u8]) -> Vec<(RecordType, &[u8])> {
     (0..n)
         .map(|_| (RecordType::new(record_types::USER_MIN), payload))
         .collect()
@@ -723,8 +723,7 @@ fn corrupt_record_at(dir: &Path, lsn: Lsn, payload_size: usize) -> BenchResult<(
 
     let meta = metas
         .iter()
-        .filter(|meta| meta.base_lsn <= lsn)
-        .last()
+        .rfind(|meta| meta.base_lsn <= lsn)
         .ok_or("could not find segment containing lsn")?;
 
     let logical_offset = lsn.as_u64() - meta.base_lsn.as_u64();

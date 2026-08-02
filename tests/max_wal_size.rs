@@ -115,9 +115,9 @@ fn append_is_rejected_when_rollover_overhead_would_push_wal_over_limit() {
     )
     .unwrap();
 
-    wal.append(RecordType::new(record_types::USER_MIN), &[1u8; 16])
-        .unwrap()
-        .start_lsn;
+    let _ = wal
+        .append(RecordType::new(record_types::USER_MIN), &[1u8; 16])
+        .unwrap();
     wal.sync().unwrap();
 
     let err = wal

@@ -68,7 +68,7 @@ fn read_valid_u32(path: &Path) -> io::Result<Option<u32>> {
 }
 
 fn is_valid_storage_write_unit(value: u32) -> bool {
-    value >= MIN_STORAGE_WRITE_UNIT && value <= MAX_STORAGE_WRITE_UNIT && value.is_power_of_two()
+    (MIN_STORAGE_WRITE_UNIT..=MAX_STORAGE_WRITE_UNIT).contains(&value) && value.is_power_of_two()
 }
 
 #[cfg(test)]

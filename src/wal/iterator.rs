@@ -164,6 +164,11 @@ impl<F: SegmentFile> WalIterator<F> {
         })
     }
 
+    // This method deliberately returns `Result<Option<_>>`: callers must
+    // distinguish clean end-of-stream from structural corruption. Implementing
+    // `Iterator` would fuse those states into `Option<Result<_>>` and break the
+    // established fallible cursor contract.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<WalRecord>, WalError> {
         loop {
             let Some(segment) = self.segments.get(self.current_segment_index) else {
@@ -174,10 +179,10 @@ impl<F: SegmentFile> WalIterator<F> {
             if self.next_lsn == segment_end_lsn {
                 self.current_segment_index += 1;
 
-                if let Some(next_segment) = self.segments.get(self.current_segment_index) {
-                    if next_segment.descriptor.base_lsn != self.next_lsn {
-                        return Err(WalError::SegmentOrderingViolation);
-                    }
+                if let Some(next_segment) = self.segments.get(self.current_segment_index)
+                    && next_segment.descriptor.base_lsn != self.next_lsn
+                {
+                    return Err(WalError::SegmentOrderingViolation);
                 }
 
                 continue;
@@ -225,10 +230,10 @@ pub(crate) fn snapshot_segments<D: SegmentDirectory>(
 
         let segment = SnapshotSegment::open(file, header)?;
 
-        if let Some(previous_end_lsn) = previous_end_lsn {
-            if segment.descriptor.base_lsn < previous_end_lsn {
-                return Err(WalError::SegmentOrderingViolation);
-            }
+        if let Some(previous_end_lsn) = previous_end_lsn
+            && segment.descriptor.base_lsn < previous_end_lsn
+        {
+            return Err(WalError::SegmentOrderingViolation);
         }
 
         previous_end_lsn = Some(segment.descriptor.written_end_lsn()?);
@@ -277,10 +282,10 @@ pub(crate) fn snapshot_segments_with_buffer<D: SegmentDirectory>(
         let file = BufferedSegmentFile::new(file, base_len, buffered_tail);
         let segment = SnapshotSegment::open(file, header)?;
 
-        if let Some(previous_end_lsn) = previous_end_lsn {
-            if segment.descriptor.base_lsn < previous_end_lsn {
-                return Err(WalError::SegmentOrderingViolation);
-            }
+        if let Some(previous_end_lsn) = previous_end_lsn
+            && segment.descriptor.base_lsn < previous_end_lsn
+        {
+            return Err(WalError::SegmentOrderingViolation);
         }
 
         previous_end_lsn = Some(segment.descriptor.written_end_lsn()?);
@@ -320,10 +325,10 @@ pub(crate) fn snapshot_segments_through<D: SegmentDirectory>(
 
         let mut segment = SnapshotSegment::open(file, header)?;
 
-        if let Some(previous_end_lsn) = previous_end_lsn {
-            if segment.descriptor.base_lsn < previous_end_lsn {
-                return Err(WalError::SegmentOrderingViolation);
-            }
+        if let Some(previous_end_lsn) = previous_end_lsn
+            && segment.descriptor.base_lsn < previous_end_lsn
+        {
+            return Err(WalError::SegmentOrderingViolation);
         }
 
         let segment_end_lsn = segment.descriptor.written_end_lsn()?;

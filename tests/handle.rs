@@ -403,10 +403,9 @@ fn durable_lsn_returns_without_waiting_for_in_flight_sync() {
     let directory = BlockingSyncDirectory::new(test_dir.path().to_path_buf());
     let (handle, _) = WalHandle::open(directory.clone(), test_dir.config(), ()).unwrap();
 
-    handle
+    let _ = handle
         .append(RecordType::new(record_types::USER_MIN), b"hello")
-        .unwrap()
-        .start_lsn;
+        .unwrap();
 
     directory.block_next_sync();
     let sync_join = {
@@ -537,10 +536,9 @@ fn sync_through_rejects_lsn_beyond_next_lsn() {
     )
     .unwrap();
 
-    handle
+    let _ = handle
         .append(RecordType::new(record_types::USER_MIN), b"hello")
-        .unwrap()
-        .start_lsn;
+        .unwrap();
 
     let err = handle.sync_through(Lsn::new(38)).unwrap_err();
 
@@ -625,10 +623,9 @@ fn tail_from_reads_existing_and_future_records() {
 
     assert!(tail.next_nonblocking().unwrap().is_none());
 
-    handle
+    let _ = handle
         .append(RecordType::new(record_types::USER_MIN + 1), b"second")
-        .unwrap()
-        .start_lsn;
+        .unwrap();
 
     let second_seen = tail.next_blocking(Duration::from_secs(1)).unwrap().unwrap();
 

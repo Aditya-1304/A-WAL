@@ -125,12 +125,12 @@ fn rollover_creates_two_segments_sorted_by_base_lsn() {
     )
     .unwrap();
 
-    wal.append(RecordType::new(record_types::USER_MIN), &[1u8; 16])
-        .unwrap()
-        .start_lsn;
-    wal.append(RecordType::new(record_types::USER_MIN), &[2u8; 16])
-        .unwrap()
-        .start_lsn;
+    let _ = wal
+        .append(RecordType::new(record_types::USER_MIN), &[1u8; 16])
+        .unwrap();
+    let _ = wal
+        .append(RecordType::new(record_types::USER_MIN), &[2u8; 16])
+        .unwrap();
 
     let directory = FsSegmentDirectory::new(test_dir.path().to_path_buf());
     let segments = directory.list_segments().unwrap();
@@ -156,12 +156,12 @@ fn sealed_segment_ends_with_segment_seal_record() {
     )
     .unwrap();
 
-    wal.append(RecordType::new(record_types::USER_MIN), &[1u8; 16])
-        .unwrap()
-        .start_lsn;
-    wal.append(RecordType::new(record_types::USER_MIN), &[2u8; 16])
-        .unwrap()
-        .start_lsn;
+    let _ = wal
+        .append(RecordType::new(record_types::USER_MIN), &[1u8; 16])
+        .unwrap();
+    let _ = wal
+        .append(RecordType::new(record_types::USER_MIN), &[2u8; 16])
+        .unwrap();
 
     let directory = FsSegmentDirectory::new(test_dir.path().to_path_buf());
     let first_segment = directory.open_segment(1).unwrap();
@@ -195,12 +195,12 @@ fn segment_seal_payload_describes_the_sealed_segment() {
     )
     .unwrap();
 
-    wal.append(RecordType::new(record_types::USER_MIN), &[1u8; 16])
-        .unwrap()
-        .start_lsn;
-    wal.append(RecordType::new(record_types::USER_MIN), &[2u8; 16])
-        .unwrap()
-        .start_lsn;
+    let _ = wal
+        .append(RecordType::new(record_types::USER_MIN), &[1u8; 16])
+        .unwrap();
+    let _ = wal
+        .append(RecordType::new(record_types::USER_MIN), &[2u8; 16])
+        .unwrap();
 
     let directory = FsSegmentDirectory::new(test_dir.path().to_path_buf());
     let first_segment = directory.open_segment(1).unwrap();
@@ -231,12 +231,12 @@ fn new_segment_header_base_lsn_matches_post_seal_tail() {
     )
     .unwrap();
 
-    wal.append(RecordType::new(record_types::USER_MIN), &[1u8; 16])
-        .unwrap()
-        .start_lsn;
-    wal.append(RecordType::new(record_types::USER_MIN), &[2u8; 16])
-        .unwrap()
-        .start_lsn;
+    let _ = wal
+        .append(RecordType::new(record_types::USER_MIN), &[1u8; 16])
+        .unwrap();
+    let _ = wal
+        .append(RecordType::new(record_types::USER_MIN), &[2u8; 16])
+        .unwrap();
 
     let directory = FsSegmentDirectory::new(test_dir.path().to_path_buf());
     let second_segment = directory.open_segment(2).unwrap();
@@ -264,12 +264,12 @@ fn rollover_preserves_old_segment_file_length_after_switch() {
     )
     .unwrap();
 
-    wal.append(RecordType::new(record_types::USER_MIN), &[1u8; 16])
-        .unwrap()
-        .start_lsn;
-    wal.append(RecordType::new(record_types::USER_MIN), &[2u8; 16])
-        .unwrap()
-        .start_lsn;
+    let _ = wal
+        .append(RecordType::new(record_types::USER_MIN), &[1u8; 16])
+        .unwrap();
+    let _ = wal
+        .append(RecordType::new(record_types::USER_MIN), &[2u8; 16])
+        .unwrap();
     wal.sync().unwrap();
 
     let directory = FsSegmentDirectory::new(test_dir.path().to_path_buf());

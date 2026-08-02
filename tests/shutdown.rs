@@ -94,9 +94,9 @@ fn read_only_fast_restart_preserves_clean_shutdown_flag() {
     let control_store = FsControlFileStore::new(test_dir.path().to_path_buf());
 
     let (mut wal, _) = Wal::open(directory.clone(), test_dir.config(), ()).unwrap();
-    wal.append(RecordType::new(record_types::USER_MIN), b"hello")
-        .unwrap()
-        .start_lsn;
+    let _ = wal
+        .append(RecordType::new(record_types::USER_MIN), b"hello")
+        .unwrap();
     wal.shutdown().unwrap();
 
     let mut config = test_dir.config();

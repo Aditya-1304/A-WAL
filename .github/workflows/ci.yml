@@ -1,0 +1,32 @@
+name: A-WAL CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out A-WAL
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+
+      - name: Format
+        run: cargo +1.97.1 fmt --all --check
+
+      - name: Test all targets and features
+        run: cargo +1.97.1 test --all-targets --all-features --locked
+
+      - name: Clippy
+        run: cargo +1.97.1 clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo +1.97.1 doc --all-features --no-deps --locked

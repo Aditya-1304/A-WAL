@@ -214,7 +214,7 @@ fn build_three_segment_history(directory: &FsSegmentDirectory) -> (u64, u64, u64
         3,
         third_base_lsn,
         compression_algorithms::NONE,
-        &[third_record.clone()],
+        std::slice::from_ref(&third_record),
     );
 
     let segment1_len = SEGMENT_HEADER_LEN + first_record.len() as u64 + seal1_record.len() as u64;

@@ -105,7 +105,10 @@ impl WalConfig {
             ));
         }
 
-        if self.write_buffer_size % self.storage_write_unit as usize != 0 {
+        if !self
+            .write_buffer_size
+            .is_multiple_of(self.storage_write_unit as usize)
+        {
             return Err(WalError::invalid_config(
                 "write_buffer_size must be a multiple of storage_write_unit",
             ));
@@ -118,7 +121,9 @@ impl WalConfig {
         }
 
         if self.record_alignment > 0
-            && self.target_segment_size % u64::from(self.record_alignment) != 0
+            && !self
+                .target_segment_size
+                .is_multiple_of(u64::from(self.record_alignment))
         {
             return Err(WalError::invalid_config(
                 "target_segment_size must be a multiple of record_alignment when alignment is enabled",
@@ -144,12 +149,12 @@ impl WalConfig {
             ));
         }
 
-        if let Some(limit) = self.max_wal_size {
-            if limit == 0 {
-                return Err(WalError::invalid_config(
-                    "max_wal_size, when set, must be greater than zero",
-                ));
-            }
+        if let Some(limit) = self.max_wal_size
+            && limit == 0
+        {
+            return Err(WalError::invalid_config(
+                "max_wal_size, when set, must be greater than zero",
+            ));
         }
 
         Ok(())
@@ -158,6 +163,10 @@ impl WalConfig {
 
 #[cfg(test)]
 mod tests {
+    // Validator tests intentionally begin with a known-good configuration and
+    // mutate exactly one field so each failure has one unambiguous cause.
+    #![allow(clippy::field_reassign_with_default)]
+
     use crate::error::WalError;
 
     use super::*;

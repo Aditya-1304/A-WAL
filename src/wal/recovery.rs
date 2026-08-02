@@ -184,6 +184,10 @@ pub(crate) fn recover_with_observer<D: SegmentDirectory>(
         report,
     })
 }
+// Recovery necessarily carries physical, logical, reporting, and observer
+// state together. Keeping the boundary explicit documents that these inputs
+// form one validation context rather than an arbitrary parameter list.
+#[allow(clippy::too_many_arguments)]
 fn recover_segment<D: SegmentDirectory>(
     directory: &D,
     meta: &SegmentMeta,
@@ -312,39 +316,10 @@ fn recover_segment<D: SegmentDirectory>(
         last_valid_record_type: scan.last_valid_record_type,
     }))
 }
-fn handle_invalid_newest_header<D: SegmentDirectory>(
-    directory: &D,
-    meta: &SegmentMeta,
-    is_latest: bool,
-    config: &WalConfig,
-    report: &mut RecoveryReport,
-    original_file_len: u64,
-    err: WalError,
-    observer: RecoveryCallbacks<'_>,
-) -> Result<Option<RecoveredSegment<D::File>>, WalError> {
-    observer.on_corruption_found(meta.base_lsn, &err);
 
-    if !is_latest {
-        return Err(WalError::CorruptionInSealedSegment);
-    }
-
-    report.note_corruption();
-
-    if config.read_only {
-        return Err(WalError::ReadOnlyTailCorruption);
-    }
-
-    if !config.truncate_tail {
-        return Err(err);
-    }
-
-    directory.remove_segment(meta.segment_id)?;
-    observer.on_truncation(meta.base_lsn, original_file_len);
-    report.note_truncation(original_file_len);
-
-    Ok(None)
-}
-
+// Segment scanning validates a complete durable-history context. The explicit
+// arguments make each independent boundary visible at the corruption site.
+#[allow(clippy::too_many_arguments)]
 fn scan_segment<F: SegmentFile>(
     file: &F,
     descriptor: &SegmentDescriptor,
@@ -606,12 +581,11 @@ fn select_checkpoint_lsn(
     control: Option<&ControlFile>,
     checkpoint_lsns: &BTreeSet<Lsn>,
 ) -> Option<Lsn> {
-    if let Some(control) = control {
-        if let Some(checkpoint_lsn) = control.last_checkpoint_lsn {
-            if checkpoint_lsns.contains(&checkpoint_lsn) {
-                return Some(checkpoint_lsn);
-            }
-        }
+    if let Some(control) = control
+        && let Some(checkpoint_lsn) = control.last_checkpoint_lsn
+        && checkpoint_lsns.contains(&checkpoint_lsn)
+    {
+        return Some(checkpoint_lsn);
     }
 
     checkpoint_lsns.last().copied()

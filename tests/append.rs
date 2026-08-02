@@ -104,9 +104,9 @@ fn flush_drains_tail_bytes_without_advancing_durable_frontier() {
     let test_dir = TestDir::new("flush");
     let mut wal = open_wal(&test_dir);
 
-    wal.append(RecordType::new(record_types::USER_MIN), b"hello")
-        .unwrap()
-        .start_lsn;
+    let _ = wal
+        .append(RecordType::new(record_types::USER_MIN), b"hello")
+        .unwrap();
 
     assert_eq!(wal.current_wal_size(), SEGMENT_HEADER_LEN);
     assert_eq!(wal.buffered_bytes(), 37);
@@ -127,9 +127,9 @@ fn sync_forces_small_tail_to_disk_and_advances_durable_frontier() {
     let test_dir = TestDir::new("sync");
     let mut wal = open_wal(&test_dir);
 
-    wal.append(RecordType::new(record_types::USER_MIN), b"hello")
-        .unwrap()
-        .start_lsn;
+    let _ = wal
+        .append(RecordType::new(record_types::USER_MIN), b"hello")
+        .unwrap();
     wal.sync().unwrap();
 
     assert_eq!(wal.buffered_bytes(), 0);
@@ -153,9 +153,9 @@ fn steady_state_drain_prefers_storage_write_unit_multiples() {
     )
     .unwrap();
 
-    wal.append(RecordType::new(record_types::USER_MIN), &[7u8; 600])
-        .unwrap()
-        .start_lsn;
+    let _ = wal
+        .append(RecordType::new(record_types::USER_MIN), &[7u8; 600])
+        .unwrap();
 
     assert_eq!(wal.current_wal_size(), SEGMENT_HEADER_LEN + 512);
     assert_eq!(wal.buffered_bytes(), 120);
@@ -246,9 +246,9 @@ fn reopen_restores_latest_next_lsn_from_segment_lengths() {
 
     {
         let mut wal = open_wal(&test_dir);
-        wal.append(RecordType::new(record_types::USER_MIN), b"hello")
-            .unwrap()
-            .start_lsn;
+        let _ = wal
+            .append(RecordType::new(record_types::USER_MIN), b"hello")
+            .unwrap();
         wal.sync().unwrap();
 
         assert_eq!(wal.first_lsn(), Some(Lsn::ZERO));

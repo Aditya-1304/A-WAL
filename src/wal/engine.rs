@@ -1363,10 +1363,10 @@ where
 
         self.drain_buffer(false)?;
 
-        if let Some(segment) = self.active_segment.as_mut() {
-            if let Err(source) = segment.file_mut().flush() {
-                return Err(self.mark_sticky_fatal("flush wal bytes", source));
-            }
+        if let Some(segment) = self.active_segment.as_mut()
+            && let Err(source) = segment.file_mut().flush()
+        {
+            return Err(self.mark_sticky_fatal("flush wal bytes", source));
         }
 
         Ok(())
@@ -1381,10 +1381,10 @@ where
         let started = Instant::now();
         self.flush_inner()?;
 
-        if let Some(segment) = self.active_segment.as_mut() {
-            if let Err(source) = segment.file_mut().sync() {
-                return Err(self.mark_sticky_fatal("sync wal segment", source));
-            }
+        if let Some(segment) = self.active_segment.as_mut()
+            && let Err(source) = segment.file_mut().sync()
+        {
+            return Err(self.mark_sticky_fatal("sync wal segment", source));
         }
 
         self.durable_lsn = self.next_lsn;
@@ -1649,13 +1649,7 @@ where
     }
 }
 
-fn read_segment_header<F: SegmentFile>(file: &F) -> Result<SegmentHeader, WalError> {
-    let mut bytes = [0u8; SegmentHeader::ENCODED_LEN];
-    read_exact_at(file, 0, &mut bytes)?;
-    SegmentHeader::decode(&bytes)
-}
-
-fn read_exact_at<F: SegmentFile>(file: &F, offset: u64, buf: &mut [u8]) -> Result<(), WalError> {
+fn _read_exact_at<F: SegmentFile>(file: &F, offset: u64, buf: &mut [u8]) -> Result<(), WalError> {
     let mut filled = 0usize;
 
     while filled < buf.len() {
@@ -1667,10 +1661,6 @@ fn read_exact_at<F: SegmentFile>(file: &F, offset: u64, buf: &mut [u8]) -> Resul
     }
 
     Ok(())
-}
-
-fn is_io_like(err: &WalError) -> bool {
-    matches!(err, WalError::Io(_) | WalError::FatalIo { .. })
 }
 
 fn physical_record_len_for_alignment(
@@ -1965,9 +1955,9 @@ mod tests {
         let test_dir = TestDir::new("flush");
         let mut wal = open_test_wal(&test_dir);
 
-        wal.append(RecordType::new(record_types::USER_MIN), b"hello")
-            .unwrap()
-            .start_lsn;
+        let _ = wal
+            .append(RecordType::new(record_types::USER_MIN), b"hello")
+            .unwrap();
         wal.flush().unwrap();
 
         assert_eq!(wal.buffered_bytes(), 0);
@@ -1983,9 +1973,9 @@ mod tests {
         let test_dir = TestDir::new("sync");
         let mut wal = open_test_wal(&test_dir);
 
-        wal.append(RecordType::new(record_types::USER_MIN), b"hello")
-            .unwrap()
-            .start_lsn;
+        let _ = wal
+            .append(RecordType::new(record_types::USER_MIN), b"hello")
+            .unwrap();
         wal.sync().unwrap();
 
         assert_eq!(wal.buffered_bytes(), 0);
@@ -2008,9 +1998,9 @@ mod tests {
         )
         .unwrap();
 
-        wal.append(RecordType::new(record_types::USER_MIN), &[7u8; 600])
-            .unwrap()
-            .start_lsn;
+        let _ = wal
+            .append(RecordType::new(record_types::USER_MIN), &[7u8; 600])
+            .unwrap();
 
         assert_eq!(wal.current_wal_size(), SEGMENT_HEADER_LEN + 512);
         assert_eq!(wal.buffered_bytes(), 120);
@@ -2055,7 +2045,7 @@ mod tests {
         let seal_offset = first_len - 56;
 
         let mut header_bytes = [0u8; RecordHeader::ENCODED_LEN];
-        read_exact_at(&first_segment, seal_offset, &mut header_bytes).unwrap();
+        _read_exact_at(&first_segment, seal_offset, &mut header_bytes).unwrap();
 
         let seal_header = RecordHeader::decode(&header_bytes).unwrap();
         assert_eq!(seal_header.record_type, record_types::SEGMENT_SEAL);
@@ -2068,9 +2058,9 @@ mod tests {
 
         {
             let mut wal = open_test_wal(&test_dir);
-            wal.append(RecordType::new(record_types::USER_MIN), b"hello")
-                .unwrap()
-                .start_lsn;
+            let _ = wal
+                .append(RecordType::new(record_types::USER_MIN), b"hello")
+                .unwrap();
             wal.sync().unwrap();
             assert_eq!(wal.next_lsn(), Lsn::new(37));
         }

@@ -46,27 +46,33 @@ fn default_config_is_valid() {
 
 #[test]
 fn minimum_valid_storage_write_unit_is_accepted() {
-    let mut config = WalConfig::default();
-    config.storage_write_unit = 512;
+    let config = WalConfig {
+        storage_write_unit: 512,
+        ..WalConfig::default()
+    };
 
     assert!(config.validate().is_ok());
 }
 
 #[test]
 fn aligned_config_can_be_valid() {
-    let mut config = WalConfig::default();
-    config.record_alignment = 4096;
-    config.target_segment_size = 64 * 1024 * 1024;
-    config.storage_write_unit = 4096;
-    config.write_buffer_size = 4 * 1024 * 1024;
+    let config = WalConfig {
+        record_alignment: 4096,
+        target_segment_size: 64 * 1024 * 1024,
+        storage_write_unit: 4096,
+        write_buffer_size: 4 * 1024 * 1024,
+        ..WalConfig::default()
+    };
 
     assert!(config.validate().is_ok());
 }
 
 #[test]
 fn max_wal_size_when_positive_is_accepted() {
-    let mut config = WalConfig::default();
-    config.max_wal_size = Some(1);
+    let config = WalConfig {
+        max_wal_size: Some(1),
+        ..WalConfig::default()
+    };
 
     assert!(config.validate().is_ok());
 }

@@ -108,10 +108,10 @@ pub fn plan_truncate_segments_before<D: SegmentDirectory>(
             Some(meta.segment_id) != active_segment_id,
         )?;
 
-        if let Some(previous_end_lsn) = previous_end_lsn {
-            if descriptor.base_lsn < previous_end_lsn {
-                return Err(WalError::SegmentOrderingViolation);
-            }
+        if let Some(previous_end_lsn) = previous_end_lsn
+            && descriptor.base_lsn < previous_end_lsn
+        {
+            return Err(WalError::SegmentOrderingViolation);
         }
 
         let segment_end_lsn = descriptor.written_end_lsn()?;
