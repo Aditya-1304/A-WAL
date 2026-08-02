@@ -19,7 +19,8 @@ This repository currently implements:
 - corruption detection in sealed history,
 - sequential replay,
 - point lookup by record LSN,
-- clean shutdown witness and fast reopen path,
+- clean shutdown witness with full-history validation on reopen,
+- durable MANIFEST witness for the newest synchronized tail,
 - whole-segment retention pruning,
 - retention pins for long-lived readers,
 - concurrent access through `WalHandle`,
@@ -84,7 +85,8 @@ This is a complete standalone WAL implementation with a narrow, explicit contrac
 | Sealed-history corruption detection | Implemented |
 | Sequential iteration | Implemented |
 | Point lookup by LSN | Implemented |
-| Clean shutdown fast path | Implemented |
+| Clean shutdown witness | Implemented; diagnostic only, full scan still required |
+| Durable tail MANIFEST | Implemented |
 | Control file | Implemented |
 | Retention pruning | Implemented |
 | Bulk retention pruning optimization | Implemented |
@@ -225,7 +227,8 @@ It owns:
 - header validation,
 - record validation,
 - checkpoint record detection,
-- clean shutdown fast path,
+- clean shutdown witness validation,
+- MANIFEST durable-tail enforcement,
 - newest-tail repair,
 - sealed-history corruption handling,
 - recovery reporting,
@@ -601,7 +604,19 @@ It stores:
 - clean shutdown flag,
 - checksum.
 
-The control file is published through a temporary file, file sync, rename, and directory sync. It is used mainly for the clean shutdown fast path and checkpoint pointer validation.
+The control file is published through a temporary file, file sync, rename, and directory sync. Its clean-shutdown flag is diagnostic: recovery still scans all retained history because process shutdown cannot prove that older files remain present and intact. The control file also participates in checkpoint pointer validation.
+
+### WAL MANIFEST
+
+The durable tail witness is named:
+
+```text
+wal.manifest
+```
+
+After synchronizing a segment, A-WAL atomically publishes the segment ID, base LSN, durable tail LSN, synchronized file length, WAL identity, and a checksum. The in-memory durable frontier advances only after this publication succeeds.
+
+The MANIFEST is a lower-bound witness, not a recovery shortcut. Recovery always performs the complete retained-history scan, but it fails closed when the witnessed newest/only segment is absent, shorter than its synchronized length, or corrupt before the witnessed durable tail. Fully valid bytes beyond an older witness may still be recovered after a crash during a later publication.
 
 ---
 
@@ -1186,7 +1201,7 @@ Shutdown:
 - publishes a clean shutdown control file,
 - rejects later appends on that handle.
 
-On next open, the WAL can use a clean shutdown fast path instead of scanning the full log.
+On next open, the clean witness is reported diagnostically. Recovery still scans and validates the complete retained log; the witness never bypasses physical history checks.
 
 ### Metrics
 
@@ -1366,6 +1381,9 @@ pub struct RecoveryReport {
 
 This makes startup behavior observable instead of mysterious.
 
+`recovery_skipped` is retained for report compatibility and remains `false` in
+the current implementation because every open validates all retained history.
+
 ### Tail corruption
 
 If corruption is found in the newest segment tail and `truncate_tail = true`, recovery truncates the invalid suffix.
@@ -1405,13 +1423,13 @@ If `read_only = true`, recovery refuses to truncate a corrupt tail because trunc
 
 Read-only mode is useful for inspection and safety checks.
 
-### Clean shutdown fast path
+### Clean shutdown witness
 
 When `shutdown()` succeeds, A-WAL writes a shutdown witness record and publishes `wal.control` with `clean_shutdown = true`.
 
-On the next open, the WAL can verify the clean tail and avoid a full scan.
+On the next open, the WAL reports the clean witness but still performs a full scan. This prevents deletion or corruption of retained history from being hidden by a previously successful shutdown.
 
-The benchmark runner includes `clean-shutdown-reopen` specifically to measure this path.
+The benchmark runner retains the `clean-shutdown-reopen` scenario name to measure a clean reopen with mandatory full-history validation.
 
 ### Recovery observer
 
@@ -1488,7 +1506,7 @@ It prints a Markdown report that can be pasted into project docs.
 | `retention-prune` | Whole-segment pruning |
 | `tail-follow` | Live append-to-tail visibility |
 | `corrupt-tail-repair` | Recovery after corrupting newest tail |
-| `clean-shutdown-reopen` | Clean shutdown fast path |
+| `clean-shutdown-reopen` | Clean reopen with full retained-history validation |
 
 ### Sample local run
 
@@ -1509,7 +1527,7 @@ Benchmark numbers depend heavily on the storage device, filesystem, mount option
 | retention-prune | 5555 | 77.374ms | 71794 | 0.00 | 659.21 | - | - | - | - | removed 5555 tiny stress segments |
 | tail-follow | 2000 | 33.561ms | 59592 | 58.20 | 60.01 | 13.667ms | 22.072ms | 22.478ms | 22.574ms | append-to-tail visibility |
 | corrupt-tail-repair | 49999 | 60.276ms | 829506 | 810.08 | 835.40 | - | - | - | - | 1 corrupt record, 1056 bytes truncated |
-| clean-shutdown-reopen | 50001 | 57.267ms | 873114 | 852.63 | 0.00 | - | - | - | - | `recovery_skipped=true` |
+| clean-shutdown-reopen | 50001 | 57.267ms | 873114 | 852.63 | 0.00 | - | - | - | - | full scan, `recovery_skipped=false` |
 
 ### Benchmark interpretation
 
@@ -1521,7 +1539,7 @@ The important takeaways:
 - recovery and replay scan around the million-records-per-second range on this local run,
 - retention pruning is now bulk-optimized,
 - corrupt tail repair correctly preserves the valid prefix,
-- clean shutdown fast path is observable and working.
+- clean shutdown witness is observable without bypassing recovery validation.
 
 The `tail-follow` benchmark currently measures end-to-end visibility under a simple producer/consumer setup and can include backlog effects. Treat it as a smoke/perf signal, not a precise wakeup-latency microbenchmark.
 
@@ -1548,7 +1566,7 @@ The test suite covers the behavior that matters for a crash-safe WAL.
 | `tests/retention_pins.rs` | Pin-protected history |
 | `tests/handle.rs` | Concurrent wrapper, sync coordination, tail iterator |
 | `tests/max_wal_size.rs` | WAL size limit admission and pruning interaction |
-| `tests/shutdown.rs` | Clean shutdown witness and fast restart |
+| `tests/shutdown.rs` | Clean shutdown witness and full-scan restart |
 
 Run everything:
 

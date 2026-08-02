@@ -60,6 +60,18 @@ pub enum WalError {
     ReadOnlyViolation,
     SegmentOrderingViolation,
 
+    /// `wal.manifest` is malformed or internally inconsistent.
+    BadWalManifest {
+        reason: String,
+    },
+
+    /// Physical files no longer cover the last tail acknowledged as durable.
+    MissingDurableWalHistory {
+        expected_segment_id: u64,
+        expected_durable_lsn: Lsn,
+        reason: String,
+    },
+
     /// two retained WAL segments do not form one exact physical history
     ///
     /// the first retained segment may begin above segment one after legitimate
@@ -252,6 +264,20 @@ impl Clone for WalError {
 
             Self::SegmentOrderingViolation => Self::SegmentOrderingViolation,
 
+            Self::BadWalManifest { reason } => Self::BadWalManifest {
+                reason: reason.clone(),
+            },
+
+            Self::MissingDurableWalHistory {
+                expected_segment_id,
+                expected_durable_lsn,
+                reason,
+            } => Self::MissingDurableWalHistory {
+                expected_segment_id: *expected_segment_id,
+                expected_durable_lsn: *expected_durable_lsn,
+                reason: reason.clone(),
+            },
+
             Self::SegmentContinuityViolation {
                 expected_segment_id,
                 found_segment_id,
@@ -319,6 +345,12 @@ impl WalError {
 
     pub fn fatal_io(operation: &'static str, source: io::Error) -> Self {
         Self::FatalIo { operation, source }
+    }
+
+    pub fn bad_manifest(reason: impl Into<String>) -> Self {
+        Self::BadWalManifest {
+            reason: reason.into(),
+        }
     }
 
     /// Return whether this error proves the live writer is fail-stopped.
@@ -389,6 +421,22 @@ impl fmt::Display for WalError {
             }
             WalError::ReadOnlyViolation => write!(f, "operation is not allowed in read-only mode"),
             WalError::SegmentOrderingViolation => write!(f, "segment ordering violation"),
+
+            WalError::BadWalManifest { reason } => {
+                write!(f, "invalid WAL manifest: {reason}")
+            }
+
+            WalError::MissingDurableWalHistory {
+                expected_segment_id,
+                expected_durable_lsn,
+                reason,
+            } => write!(
+                f,
+                "durable WAL history is missing: expected segment {} through LSN {}: {}",
+                expected_segment_id,
+                expected_durable_lsn.as_u64(),
+                reason,
+            ),
 
             WalError::SegmentContinuityViolation {
                 expected_segment_id,

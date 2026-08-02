@@ -53,8 +53,8 @@ impl Drop for TestDir {
 }
 
 #[test]
-fn shutdown_sets_clean_witness_rejects_future_appends_and_fast_restarts() {
-    let test_dir = TestDir::new("fast-path");
+fn shutdown_sets_clean_witness_rejects_future_appends_and_fully_scans_on_restart() {
+    let test_dir = TestDir::new("full-scan-restart");
     let directory = FsSegmentDirectory::new(test_dir.path().to_path_buf());
     let control_store = FsControlFileStore::new(test_dir.path().to_path_buf());
 
@@ -88,7 +88,7 @@ fn shutdown_sets_clean_witness_rejects_future_appends_and_fast_restarts() {
 }
 
 #[test]
-fn read_only_fast_restart_preserves_clean_shutdown_flag() {
+fn read_only_restart_preserves_clean_shutdown_flag_after_full_scan() {
     let test_dir = TestDir::new("read-only");
     let directory = FsSegmentDirectory::new(test_dir.path().to_path_buf());
     let control_store = FsControlFileStore::new(test_dir.path().to_path_buf());

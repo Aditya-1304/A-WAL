@@ -217,6 +217,134 @@ fn recovery_rejects_missing_middle_segment() {
 
 /// Realistic bug caught:
 ///
+/// With no successor segment, directory continuity checks have no evidence that
+/// the only acknowledged segment ever existed. The durable MANIFEST must keep
+/// that deletion from being mistaken for a brand-new empty WAL.
+#[test]
+fn recovery_rejects_deletion_of_the_only_durable_segment() {
+    let test_dir = TestDir::new("missing-only-segment");
+    let directory = FsSegmentDirectory::new(test_dir.path().to_path_buf());
+
+    let segment_path = {
+        let (mut wal, _) = Wal::open(directory.clone(), test_dir.config(), ()).unwrap();
+        let _ = wal
+            .append(RecordType::new(record_types::USER_MIN), b"durable")
+            .unwrap();
+        wal.sync().unwrap();
+        segment_path(&directory, 1)
+    };
+
+    fs::remove_file(segment_path).unwrap();
+
+    assert!(matches!(
+        Wal::open(directory, test_dir.config(), ()),
+        Err(WalError::MissingDurableWalHistory {
+            expected_segment_id: 1,
+            ..
+        })
+    ));
+}
+
+/// Realistic bug caught:
+///
+/// A WAL created before MANIFEST support may already contain acknowledged
+/// history. A writable upgrade must publish a witness before serving traffic;
+/// otherwise deletion before the first post-upgrade write would remain silent.
+#[test]
+fn writable_open_migrates_legacy_history_before_returning() {
+    let test_dir = TestDir::new("legacy-manifest-migration");
+    let directory = FsSegmentDirectory::new(test_dir.path().to_path_buf());
+    let record = user_record(0, b"legacy-durable", Lsn::ZERO);
+    create_segment(&directory, 1, Lsn::ZERO, &[record]);
+
+    let segment_path = segment_path(&directory, 1);
+    {
+        let (_wal, _) = Wal::open(directory.clone(), test_dir.config(), ()).unwrap();
+    }
+    fs::remove_file(segment_path).unwrap();
+
+    assert!(matches!(
+        Wal::open(directory, test_dir.config(), ()),
+        Err(WalError::MissingDurableWalHistory {
+            expected_segment_id: 1,
+            ..
+        })
+    ));
+}
+
+/// Realistic bug caught:
+///
+/// Removing the newest acknowledged segment leaves a valid sealed prefix, so
+/// adjacent-segment validation alone would silently recover stale state. The
+/// MANIFEST must prove that the later durable tail is required.
+#[test]
+fn recovery_rejects_deletion_of_the_newest_durable_segment() {
+    let test_dir = TestDir::new("missing-newest-segment");
+    let directory = FsSegmentDirectory::new(test_dir.path().to_path_buf());
+    let mut config = test_dir.config();
+    config.max_record_size = 64;
+    config.target_segment_size = SEGMENT_HEADER_LEN + (32 + 64) + (32 + 24);
+
+    let newest_path = {
+        let (mut wal, _) = Wal::open(directory.clone(), config.clone(), ()).unwrap();
+        let _ = wal
+            .append(RecordType::new(record_types::USER_MIN), &[1; 64])
+            .unwrap();
+        let _ = wal
+            .append(RecordType::new(record_types::USER_MIN + 1), &[2; 64])
+            .unwrap();
+        wal.sync().unwrap();
+        assert_eq!(wal.active_segment_id(), Some(2));
+        segment_path(&directory, 2)
+    };
+
+    fs::remove_file(newest_path).unwrap();
+
+    assert!(matches!(
+        Wal::open(directory, config, ()),
+        Err(WalError::MissingDurableWalHistory {
+            expected_segment_id: 2,
+            ..
+        })
+    ));
+}
+
+/// Realistic bug caught:
+///
+/// Maximal-prefix repair is correct only for an uncertain crash suffix. If a
+/// checksum failure begins before the MANIFEST's acknowledged durable LSN,
+/// truncating it would silently discard a record whose sync already succeeded.
+#[test]
+fn recovery_never_repairs_below_the_manifest_durable_tail() {
+    let test_dir = TestDir::new("corrupt-witnessed-tail");
+    let directory = FsSegmentDirectory::new(test_dir.path().to_path_buf());
+
+    let path = {
+        let (mut wal, _) = Wal::open(directory.clone(), test_dir.config(), ()).unwrap();
+        let _ = wal
+            .append(RecordType::new(record_types::USER_MIN), b"durable")
+            .unwrap();
+        wal.sync().unwrap();
+        segment_path(&directory, 1)
+    };
+
+    let original_len = fs::metadata(&path).unwrap().len();
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[SEGMENT_HEADER_LEN as usize + RecordHeader::ENCODED_LEN] ^= 0xff;
+    fs::write(&path, bytes).unwrap();
+
+    assert!(matches!(
+        Wal::open(directory, test_dir.config(), ()),
+        Err(WalError::MissingDurableWalHistory {
+            expected_segment_id: 1,
+            ..
+        })
+    ));
+    assert_eq!(fs::metadata(path).unwrap().len(), original_len);
+}
+
+/// Realistic bug caught:
+///
 /// Adjacent segment IDs alone do not prove a contiguous logical WAL. A segment
 /// whose base LSN jumps forward would otherwise hide durable bytes.
 #[test]

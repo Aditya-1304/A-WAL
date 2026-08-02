@@ -12,6 +12,7 @@ use crate::{
         buffer::{AppendBuffer, AppendBufferError},
         control_file::FsControlFileStore,
         directory::{NewSegment, SegmentDirectory},
+        manifest::{FsWalManifestStore, WalManifest},
         segment_file::SegmentFile,
     },
     lsn::Lsn,
@@ -38,6 +39,7 @@ where
 {
     directory: D,
     control_store: FsControlFileStore,
+    manifest_store: FsWalManifestStore,
     config: WalConfig,
     active_segment: Option<ActiveSegment<D::File>>,
     write_buffer: AppendBuffer,
@@ -175,6 +177,7 @@ where
         Self::validate_constraints(&config)?;
 
         let control_store = FsControlFileStore::new(config.dir.clone());
+        let manifest_store = FsWalManifestStore::new(config.dir.clone());
         let prior_control = control_store.load_for_recovery(config.identity)?;
         let write_buffer = AppendBuffer::new(config.write_buffer_size);
 
@@ -194,6 +197,29 @@ where
             active_segment_record_count,
             report,
         } = recovered;
+
+        // A writable upgrade of a pre-MANIFEST WAL must not enter service with
+        // an unwitnessed durable tail. Recovery has already validated (and, if
+        // necessary, synchronized a repaired suffix of) every retained segment,
+        // so publish that exact frontier before returning the live writer. This
+        // also advances an older lower-bound witness to any additional valid
+        // bytes accepted during crash recovery.
+        if !config.read_only && current_wal_size != 0 {
+            let latest = directory
+                .list_segments()?
+                .into_iter()
+                .last()
+                .ok_or(WalError::BrokenDurabilityContract)?;
+            let synchronized_file_len = directory.open_segment_meta(&latest)?.len()?;
+            let manifest = WalManifest::new(
+                config.identity,
+                latest.segment_id,
+                latest.base_lsn,
+                next_lsn,
+                synchronized_file_len,
+            )?;
+            manifest_store.publish(&manifest)?;
+        }
 
         let checkpoint_state = CheckpointState {
             last_checkpoint_lsn: report.checkpoint_lsn,
@@ -217,6 +243,7 @@ where
         let wal = Self {
             directory,
             control_store,
+            manifest_store,
             config,
             active_segment,
             write_buffer,
@@ -1385,6 +1412,27 @@ where
             && let Err(source) = segment.file_mut().sync()
         {
             return Err(self.mark_sticky_fatal("sync wal segment", source));
+        }
+
+        // Segment fsync establishes physical durability. MANIFEST publication
+        // then records the minimum tail that every future recovery must find.
+        // `durable_lsn` advances only after both steps complete, so no caller
+        // can receive a durability acknowledgement that lacks a tail witness.
+        if let Some(segment) = self.active_segment.as_ref() {
+            let manifest = match WalManifest::new(
+                self.config.identity,
+                segment.segment_id(),
+                segment.base_lsn(),
+                self.next_lsn,
+                segment.file_len(),
+            ) {
+                Ok(manifest) => manifest,
+                Err(_) => return Err(self.mark_broken_durability_contract()),
+            };
+
+            if let Err(error) = self.manifest_store.publish(&manifest) {
+                return Err(self.promote_mutating_error("publish WAL manifest", error));
+            }
         }
 
         self.durable_lsn = self.next_lsn;

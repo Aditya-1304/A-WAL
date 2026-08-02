@@ -10,6 +10,7 @@ use crate::{
     io::{
         control_file::{ControlFile, FsControlFileStore},
         directory::{SegmentDirectory, SegmentMeta},
+        manifest::{FsWalManifestStore, WalManifest},
         segment_file::SegmentFile,
     },
     lsn::Lsn,
@@ -75,6 +76,12 @@ pub(crate) fn recover_with_observer<D: SegmentDirectory>(
     let started = Instant::now();
     let mut report = RecoveryReport::empty();
 
+    // Unlike the clean-shutdown control file, the MANIFEST is a fail-closed
+    // durability witness. A present witness must be valid and physically
+    // covered before recovery is allowed to repair or publish any state.
+    let manifest_store = FsWalManifestStore::new(config.dir.clone());
+    let manifest = manifest_store.load_for_recovery(config.identity)?;
+
     let control = control_store.load_for_recovery(config.identity)?;
     let control_checkpoint = control.as_ref().and_then(|control| {
         control
@@ -89,6 +96,8 @@ pub(crate) fn recover_with_observer<D: SegmentDirectory>(
     );
 
     let metas = directory.list_segments()?;
+    validate_manifest_physical_floor(directory, &metas, manifest.as_ref())?;
+
     if metas.is_empty() {
         report.set_next_lsn(Lsn::ZERO);
         report.set_checkpoint_lsn(None);
@@ -126,6 +135,7 @@ pub(crate) fn recover_with_observer<D: SegmentDirectory>(
             &mut checkpoint_lsns,
             previous_segment_boundary,
             control_checkpoint,
+            manifest.as_ref(),
             observer,
         )?;
 
@@ -151,6 +161,18 @@ pub(crate) fn recover_with_observer<D: SegmentDirectory>(
         Some(segment) => segment.descriptor.written_end_lsn()?,
         None => Lsn::ZERO,
     };
+
+    if let Some(manifest) = &manifest
+        && next_lsn < manifest.durable_lsn
+    {
+        return Err(missing_durable_history(
+            manifest,
+            format!(
+                "validated history ends at LSN {}, before the witnessed durable tail",
+                next_lsn.as_u64()
+            ),
+        ));
+    }
 
     let next_segment_id = match last_kept_segment.as_ref() {
         Some(segment) => segment
@@ -197,6 +219,7 @@ fn recover_segment<D: SegmentDirectory>(
     checkpoint_lsns: &mut BTreeSet<Lsn>,
     previous_segment_boundary: Option<(SegmentId, Lsn)>,
     control_checkpoint: Option<(Lsn, u64)>,
+    manifest: Option<&WalManifest>,
     observer: RecoveryCallbacks<'_>,
 ) -> Result<Option<RecoveredSegment<D::File>>, WalError> {
     observer.on_segment_start(meta.segment_id, meta.base_lsn);
@@ -278,6 +301,19 @@ fn recover_segment<D: SegmentDirectory>(
             return Err(WalError::CorruptionInSealedSegment);
         }
 
+        if let Some(manifest) = manifest
+            && descriptor.segment_id == manifest.tail_segment_id
+            && corruption_lsn < manifest.durable_lsn
+        {
+            return Err(missing_durable_history(
+                manifest,
+                format!(
+                    "corruption at LSN {} precedes the witnessed durable tail",
+                    corruption_lsn.as_u64()
+                ),
+            ));
+        }
+
         if config.read_only {
             return Err(WalError::ReadOnlyTailCorruption);
         }
@@ -315,6 +351,61 @@ fn recover_segment<D: SegmentDirectory>(
         record_count: scan.record_count,
         last_valid_record_type: scan.last_valid_record_type,
     }))
+}
+
+fn validate_manifest_physical_floor<D: SegmentDirectory>(
+    directory: &D,
+    metas: &[SegmentMeta],
+    manifest: Option<&WalManifest>,
+) -> Result<(), WalError> {
+    let Some(manifest) = manifest else {
+        // WALs created before MANIFEST support remain readable and are migrated
+        // by the next successful synchronization. Once present, the witness is
+        // always enforced fail-closed.
+        return Ok(());
+    };
+
+    let Some(meta) = metas
+        .iter()
+        .find(|meta| meta.segment_id == manifest.tail_segment_id)
+    else {
+        return Err(missing_durable_history(
+            manifest,
+            "the witnessed tail segment is absent from the WAL directory",
+        ));
+    };
+
+    if meta.base_lsn != manifest.tail_segment_base_lsn {
+        return Err(missing_durable_history(
+            manifest,
+            format!(
+                "tail segment base LSN is {}, expected {}",
+                meta.base_lsn.as_u64(),
+                manifest.tail_segment_base_lsn.as_u64()
+            ),
+        ));
+    }
+
+    let file_len = directory.open_segment_meta(meta)?.len()?;
+    if file_len < manifest.synchronized_file_len {
+        return Err(missing_durable_history(
+            manifest,
+            format!(
+                "tail segment length is {}, below synchronized length {}",
+                file_len, manifest.synchronized_file_len
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+fn missing_durable_history(manifest: &WalManifest, reason: impl Into<String>) -> WalError {
+    WalError::MissingDurableWalHistory {
+        expected_segment_id: manifest.tail_segment_id,
+        expected_durable_lsn: manifest.durable_lsn,
+        reason: reason.into(),
+    }
 }
 
 // Segment scanning validates a complete durable-history context. The explicit
