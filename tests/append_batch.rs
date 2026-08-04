@@ -8,7 +8,10 @@ use std::{
 use wal::{
     config::{SEGMENT_HEADER_LEN, SyncPolicy, WalConfig},
     error::WalError,
-    io::directory::{FsSegmentDirectory, SegmentDirectory},
+    io::{
+        directory::{FsSegmentDirectory, SegmentDirectory},
+        fault::FaultDirectory,
+    },
     lsn::Lsn,
     types::{RecordType, WalIdentity, record_types},
     wal::{engine::Wal, handle::WalHandle},
@@ -263,4 +266,74 @@ fn append_batch_accounts_for_rollover_overhead_during_preflight() {
 
     let directory = FsSegmentDirectory::new(test_dir.path().to_path_buf());
     assert!(directory.list_segments().unwrap().is_empty());
+}
+
+/// Realistic bug caught: a first batch record can acquire a logical extent and
+/// then fail while draining bytes. Reporting `NotStaged` would allow the
+/// caller to retry a logical operation whose first record may already exist.
+#[test]
+fn append_batch_preserves_unknown_outcome_when_first_record_fails_after_staging() {
+    let test_dir = TestDir::new("unknown-first-record");
+    let mut config = test_dir.config();
+    config.max_record_size = 600;
+    config.storage_write_unit = 512;
+    config.write_buffer_size = 4096;
+
+    let directory = FaultDirectory::new(test_dir.path().to_path_buf());
+    directory.inject_partial_append(1, 1).unwrap();
+    let mut wal = Wal::open(directory, config, ()).unwrap().0;
+
+    let batch = [
+        (RecordType::new(record_types::USER_MIN), &[7u8; 500][..]),
+        (RecordType::new(record_types::USER_MIN + 1), &[8u8; 500][..]),
+    ];
+
+    let error = wal.append_batch_extents(&batch).unwrap_err();
+
+    match error {
+        wal::error::BatchAppendFailure::OutcomeUnknown { result, .. } => {
+            assert_eq!(result.record_extents.len(), 1);
+            assert_eq!(result.record_extents[0].start_lsn, Lsn::ZERO);
+            assert_eq!(result.final_end_lsn, result.record_extents[0].end_lsn);
+        }
+        wal::error::BatchAppendFailure::NotStaged(_) => {
+            panic!("a staged first record must be reported as outcome-unknown")
+        }
+    }
+}
+
+/// Realistic bug caught: when a later batch record fails after acquiring an
+/// extent, omitting that extent leaves recovery without the complete set of
+/// records whose durable outcome is uncertain.
+#[test]
+fn append_batch_includes_middle_record_extent_in_unknown_outcome() {
+    let test_dir = TestDir::new("unknown-middle-record");
+    let mut config = test_dir.config();
+    config.max_record_size = 600;
+    config.storage_write_unit = 512;
+    config.write_buffer_size = 4096;
+    config.target_segment_size = SEGMENT_HEADER_LEN + 632 + 56;
+
+    let directory = FaultDirectory::new(test_dir.path().to_path_buf());
+    directory.inject_partial_append(2, 1).unwrap();
+    let mut wal = Wal::open(directory, config, ()).unwrap().0;
+
+    let batch = [
+        (RecordType::new(record_types::USER_MIN), &[7u8; 500][..]),
+        (RecordType::new(record_types::USER_MIN + 1), &[8u8; 500][..]),
+    ];
+
+    let error = wal.append_batch_extents(&batch).unwrap_err();
+
+    match error {
+        wal::error::BatchAppendFailure::OutcomeUnknown { result, .. } => {
+            assert_eq!(result.record_extents.len(), 2);
+            assert_eq!(result.record_extents[0].start_lsn, Lsn::ZERO);
+            assert!(result.record_extents[1].start_lsn > result.record_extents[0].end_lsn);
+            assert_eq!(result.final_end_lsn, result.record_extents[1].end_lsn);
+        }
+        wal::error::BatchAppendFailure::NotStaged(_) => {
+            panic!("a staged middle record must be reported as outcome-unknown")
+        }
+    }
 }

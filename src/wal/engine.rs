@@ -392,7 +392,7 @@ where
         &mut self,
         records: &[(RecordType, &[u8])],
     ) -> Result<Vec<AppendResult>, crate::error::BatchAppendFailure> {
-        use crate::error::BatchAppendFailure;
+        use crate::error::{AppendFailure, BatchAppendFailure};
         struct PreparedBatchRecord {
             record_type: RecordType,
             original_payload_len: u64,
@@ -445,29 +445,46 @@ where
         let mut appended_bytes = 0u64;
 
         for record in prepared {
-            let lsn = match self.stage_record(
+            let extent = match self.stage_record_with_extent(
                 record.record_type,
                 record.flags,
                 &record.on_disk_payload,
                 true,
             ) {
-                Ok(lsn) => lsn,
-                Err(err) => {
+                Ok(extent) => extent,
+                Err(AppendFailure::NotStaged(source)) => {
                     if appended_records > 0 {
                         self.metrics
                             .note_appended_records(appended_records, appended_bytes);
                     }
                     return Err(if extents.is_empty() {
-                        BatchAppendFailure::NotStaged(err)
+                        BatchAppendFailure::NotStaged(source)
                     } else {
                         BatchAppendFailure::OutcomeUnknown {
                             result: BatchAppendResult::from_extents(extents)
                                 .expect("non-empty staged batch has a final extent"),
-                            source: err,
+                            source,
                         }
                     });
                 }
+                Err(AppendFailure::OutcomeUnknown { extent, source }) => {
+                    // The current record already owns a logical extent. Include it
+                    // before returning so recovery receives every record whose
+                    // durable outcome became uncertain, including the failing one.
+                    extents.push(extent);
+                    if appended_records > 0 {
+                        self.metrics
+                            .note_appended_records(appended_records, appended_bytes);
+                    }
+                    return Err(BatchAppendFailure::OutcomeUnknown {
+                        result: BatchAppendResult::from_extents(extents)
+                            .expect("the failing record has a staged extent"),
+                        source,
+                    });
+                }
             };
+
+            let lsn = extent.start_lsn;
 
             // Once staging succeeds the current record is part of the unknown
             // crash outcome. Record its exact extent before updating any
