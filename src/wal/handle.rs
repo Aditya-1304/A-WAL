@@ -162,6 +162,17 @@ where
         self.with_wal_mut(|wal| wal.append_batch(records))
     }
 
+    /// Append one ordered batch and return every exact durable record extent.
+    ///
+    /// The writer mutex covers staging and synchronization as one operation,
+    /// so another node subsystem cannot interleave records inside the batch.
+    pub fn append_batch_and_sync(
+        &self,
+        records: &[(RecordType, &[u8])],
+    ) -> Result<crate::wal::BatchAppendResult, crate::error::BatchAppendFailure> {
+        self.with_wal_mut(|wal| wal.append_batch_and_sync(records))
+    }
+
     pub fn flush(&self) -> Result<(), WalError> {
         self.with_wal_mut(Wal::flush)
     }

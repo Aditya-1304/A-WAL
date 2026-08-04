@@ -1,6 +1,10 @@
 use std::{fmt, io};
 
-use crate::{lsn::Lsn, types::WalIdentity, wal::engine::AppendResult};
+use crate::{
+    lsn::Lsn,
+    types::WalIdentity,
+    wal::engine::{AppendResult, BatchAppendResult},
+};
 
 #[derive(Debug)]
 pub enum WalError {
@@ -114,6 +118,7 @@ pub enum WalError {
         reason: String,
     },
     ReservationOverflow,
+    EmptyBatch,
 }
 
 /// failure classification for a single record WAL append
@@ -143,6 +148,60 @@ pub enum AppendFailure {
         /// failure that prevented the WAL from proving durability
         source: WalError,
     },
+}
+
+/// Failure classification for an ordered multi-record append.
+///
+/// `OutcomeUnknown` carries every extent assigned before the failure. Callers
+/// must recover the WAL before retrying the logical batch because any prefix,
+/// including the complete batch, may be present after restart.
+#[derive(Debug, Clone)]
+pub enum BatchAppendFailure {
+    NotStaged(WalError),
+    OutcomeUnknown {
+        result: BatchAppendResult,
+        source: WalError,
+    },
+}
+
+impl BatchAppendFailure {
+    pub fn into_source(self) -> WalError {
+        match self {
+            Self::NotStaged(source) | Self::OutcomeUnknown { source, .. } => source,
+        }
+    }
+
+    pub fn extents(&self) -> &[AppendResult] {
+        match self {
+            Self::NotStaged(_) => &[],
+            Self::OutcomeUnknown { result, .. } => &result.record_extents,
+        }
+    }
+
+    pub const fn wal_error(&self) -> &WalError {
+        match self {
+            Self::NotStaged(source) | Self::OutcomeUnknown { source, .. } => source,
+        }
+    }
+}
+
+impl fmt::Display for BatchAppendFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotStaged(source) => write!(formatter, "WAL batch was not staged: {source}"),
+            Self::OutcomeUnknown { result, source } => write!(
+                formatter,
+                "WAL batch outcome is unknown after assigning {} record extents: {source}",
+                result.record_extents.len()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BatchAppendFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.wal_error())
+    }
 }
 
 impl AppendFailure {
@@ -322,6 +381,7 @@ impl Clone for WalError {
             },
 
             Self::ReservationOverflow => Self::ReservationOverflow,
+            Self::EmptyBatch => Self::EmptyBatch,
         }
     }
 }
@@ -494,6 +554,7 @@ impl fmt::Display for WalError {
                 write!(f, "decompression error: {reason}")
             }
             WalError::ReservationOverflow => write!(f, "reservation overflow"),
+            WalError::EmptyBatch => write!(f, "WAL append batch must not be empty"),
         }
     }
 }

@@ -11,7 +11,7 @@ use wal::{
     io::directory::{FsSegmentDirectory, SegmentDirectory},
     lsn::Lsn,
     types::{RecordType, WalIdentity, record_types},
-    wal::engine::Wal,
+    wal::{engine::Wal, handle::WalHandle},
 };
 
 struct TestDir {
@@ -125,6 +125,60 @@ fn append_batch_assigns_contiguous_lsns_and_reads_back_records() {
         metrics.bytes_appended,
         u64::from(first.total_len) + u64::from(second.total_len) + u64::from(third.total_len)
     );
+}
+
+/// Realistic bug caught: a database could acknowledge a multi-record logical
+/// transition after syncing only the final record's start LSN, leaving framing
+/// bytes beyond the durable frontier after a crash.
+#[test]
+fn append_batch_and_sync_returns_exact_durable_extents() {
+    let test_dir = TestDir::new("durable-extents");
+    let (handle, _) = WalHandle::open(
+        FsSegmentDirectory::new(test_dir.path().to_path_buf()),
+        test_dir.config(),
+        (),
+    )
+    .unwrap();
+
+    let batch = [
+        (RecordType::new(record_types::USER_MIN), &b"alpha"[..]),
+        (RecordType::new(record_types::USER_MIN + 1), &b"beta"[..]),
+    ];
+
+    let result = handle.append_batch_and_sync(&batch).unwrap();
+    let extents = &result.record_extents;
+
+    assert_eq!(extents.len(), 2);
+    assert_eq!(extents[0].start_lsn, Lsn::ZERO);
+    assert_eq!(extents[0].end_lsn, extents[1].start_lsn);
+    assert!(extents[1].is_durable_at(handle.durable_lsn()));
+    assert_eq!(result.final_end_lsn, extents[1].end_lsn);
+    assert_eq!(
+        handle.read_at(extents[0].start_lsn).unwrap().payload,
+        b"alpha"
+    );
+    assert_eq!(
+        handle.read_at(extents[1].start_lsn).unwrap().payload,
+        b"beta"
+    );
+}
+
+#[test]
+fn append_batch_and_sync_rejects_empty_batches_before_admission() {
+    let test_dir = TestDir::new("empty-durable-batch");
+    let (handle, _) = WalHandle::open(
+        FsSegmentDirectory::new(test_dir.path().to_path_buf()),
+        test_dir.config(),
+        (),
+    )
+    .unwrap();
+
+    let error = handle.append_batch_and_sync(&[]).unwrap_err();
+    assert!(matches!(
+        error,
+        wal::error::BatchAppendFailure::NotStaged(WalError::EmptyBatch)
+    ));
+    assert_eq!(handle.durable_lsn(), Lsn::ZERO);
 }
 
 #[test]

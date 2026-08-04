@@ -100,6 +100,28 @@ pub struct AppendResult {
     pub end_lsn: Lsn,
 }
 
+/// Exact logical extents assigned to one ordered append batch.
+#[must_use = "batch results contain the exact durability frontier"]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchAppendResult {
+    pub record_extents: Vec<AppendResult>,
+    pub final_end_lsn: Lsn,
+}
+
+impl BatchAppendResult {
+    fn from_extents(record_extents: Vec<AppendResult>) -> Option<Self> {
+        let final_end_lsn = record_extents.last()?.end_lsn;
+        Some(Self {
+            record_extents,
+            final_end_lsn,
+        })
+    }
+
+    pub const fn is_durable_at(&self, durable_lsn: Lsn) -> bool {
+        durable_lsn.0 >= self.final_end_lsn.0
+    }
+}
+
 impl AppendResult {
     /// return whether the complete record is covered by `durable_lsn`
     ///
@@ -366,7 +388,11 @@ where
         Ok(extent)
     }
 
-    pub fn append_batch(&mut self, records: &[(RecordType, &[u8])]) -> Result<Vec<Lsn>, WalError> {
+    pub fn append_batch_extents(
+        &mut self,
+        records: &[(RecordType, &[u8])],
+    ) -> Result<Vec<AppendResult>, crate::error::BatchAppendFailure> {
+        use crate::error::BatchAppendFailure;
         struct PreparedBatchRecord {
             record_type: RecordType,
             original_payload_len: u64,
@@ -375,7 +401,8 @@ where
             record_bytes: u64,
         }
 
-        self.ensure_operational()?;
+        self.ensure_operational()
+            .map_err(BatchAppendFailure::NotStaged)?;
 
         if records.is_empty() {
             return Ok(Vec::new());
@@ -386,16 +413,19 @@ where
 
         for &(record_type, payload) in records {
             if payload.len() > self.config.max_record_size as usize {
-                return Err(WalError::PayloadTooLarge {
+                return Err(BatchAppendFailure::NotStaged(WalError::PayloadTooLarge {
                     len: payload.len() as u32,
                     max: self.config.max_record_size,
-                });
+                }));
             }
 
             let original_payload_len = payload.len() as u64;
-            let (on_disk_payload, flags) = self.prepare_payload_for_append(payload)?;
-            let record_bytes =
-                self.record_physical_len_for_payload_len(on_disk_payload.len())? as u64;
+            let (on_disk_payload, flags) = self
+                .prepare_payload_for_append(payload)
+                .map_err(BatchAppendFailure::NotStaged)?;
+            let record_bytes = self
+                .record_physical_len_for_payload_len(on_disk_payload.len())
+                .map_err(BatchAppendFailure::NotStaged)? as u64;
 
             prepared.push(PreparedBatchRecord {
                 record_type,
@@ -407,9 +437,10 @@ where
             record_lens.push(record_bytes);
         }
 
-        self.preflight_batch_append(&record_lens, true)?;
+        self.preflight_batch_append(&record_lens, true)
+            .map_err(BatchAppendFailure::NotStaged)?;
 
-        let mut lsns = Vec::with_capacity(prepared.len());
+        let mut extents = Vec::with_capacity(prepared.len());
         let mut appended_records = 0u64;
         let mut appended_bytes = 0u64;
 
@@ -426,14 +457,35 @@ where
                         self.metrics
                             .note_appended_records(appended_records, appended_bytes);
                     }
-                    return Err(err);
+                    return Err(if extents.is_empty() {
+                        BatchAppendFailure::NotStaged(err)
+                    } else {
+                        BatchAppendFailure::OutcomeUnknown {
+                            result: BatchAppendResult::from_extents(extents)
+                                .expect("non-empty staged batch has a final extent"),
+                            source: err,
+                        }
+                    });
                 }
             };
+
+            // Once staging succeeds the current record is part of the unknown
+            // crash outcome. Record its exact extent before updating any
+            // accounting field that can still report an invariant failure.
+            extents.push(AppendResult {
+                start_lsn: lsn,
+                end_lsn: self.next_lsn,
+            });
 
             self.active_segment_record_count = self
                 .active_segment_record_count
                 .checked_add(1)
-                .ok_or(WalError::ReservationOverflow)?;
+                .ok_or(WalError::ReservationOverflow)
+                .map_err(|source| BatchAppendFailure::OutcomeUnknown {
+                    result: BatchAppendResult::from_extents(extents.clone())
+                        .expect("staged batch has an extent"),
+                    source,
+                })?;
 
             if self.first_lsn.is_none() {
                 self.first_lsn = Some(lsn);
@@ -441,10 +493,20 @@ where
 
             appended_records = appended_records
                 .checked_add(1)
-                .ok_or(WalError::ReservationOverflow)?;
+                .ok_or(WalError::ReservationOverflow)
+                .map_err(|source| BatchAppendFailure::OutcomeUnknown {
+                    result: BatchAppendResult::from_extents(extents.clone())
+                        .expect("staged batch has an extent"),
+                    source,
+                })?;
             appended_bytes = appended_bytes
                 .checked_add(record.record_bytes)
-                .ok_or(WalError::ReservationOverflow)?;
+                .ok_or(WalError::ReservationOverflow)
+                .map_err(|source| BatchAppendFailure::OutcomeUnknown {
+                    result: BatchAppendResult::from_extents(extents.clone())
+                        .expect("staged batch has an extent"),
+                    source,
+                })?;
 
             if record.flags & record_flags::COMPRESSED != 0 {
                 self.metrics.note_compression(
@@ -452,18 +514,61 @@ where
                     record.on_disk_payload.len() as u64,
                 );
             }
-
-            lsns.push(lsn);
         }
 
         self.metrics
             .note_batch_append(appended_records, appended_bytes);
 
         if matches!(self.config.sync_policy, SyncPolicy::Always) {
-            self.sync()?;
+            self.sync()
+                .map_err(|source| BatchAppendFailure::OutcomeUnknown {
+                    result: BatchAppendResult::from_extents(extents.clone())
+                        .expect("non-empty batch has a final extent"),
+                    source,
+                })?;
         }
 
-        Ok(lsns)
+        Ok(extents)
+    }
+
+    /// Legacy start-LSN API retained for callers that do not publish durable
+    /// outcomes. New durability-sensitive code must use exact batch extents.
+    pub fn append_batch(&mut self, records: &[(RecordType, &[u8])]) -> Result<Vec<Lsn>, WalError> {
+        self.append_batch_extents(records)
+            .map(|extents| extents.into_iter().map(|extent| extent.start_lsn).collect())
+            .map_err(crate::error::BatchAppendFailure::into_source)
+    }
+
+    /// Append an ordered batch and synchronize through its exact final extent.
+    pub fn append_batch_and_sync(
+        &mut self,
+        records: &[(RecordType, &[u8])],
+    ) -> Result<BatchAppendResult, crate::error::BatchAppendFailure> {
+        use crate::error::BatchAppendFailure;
+
+        if records.is_empty() {
+            return Err(BatchAppendFailure::NotStaged(WalError::EmptyBatch));
+        }
+
+        let extents = self.append_batch_extents(records)?;
+        let result = BatchAppendResult::from_extents(extents)
+            .expect("non-empty input produces a non-empty successful batch");
+
+        if !result.is_durable_at(self.durable_lsn) {
+            self.sync()
+                .map_err(|source| BatchAppendFailure::OutcomeUnknown {
+                    result: result.clone(),
+                    source,
+                })?;
+        }
+
+        self.verify_durable_through(result.final_end_lsn)
+            .map_err(|source| BatchAppendFailure::OutcomeUnknown {
+                result: result.clone(),
+                source,
+            })?;
+
+        Ok(result)
     }
 
     pub fn reserve(
